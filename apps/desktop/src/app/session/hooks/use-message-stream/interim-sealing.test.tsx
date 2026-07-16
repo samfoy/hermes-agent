@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { chatMessageText } from '@/lib/chat-messages'
+import { $todosBySession, clearSessionTodos, setSessionTodos } from '@/store/todos'
 import type { RpcEvent } from '@/types/hermes'
 
 import { useMessageStream } from './index'
@@ -14,6 +15,8 @@ const SID = 'session-1'
 
 let handleEvent: ((event: RpcEvent) => void) | null = null
 let sessionStates: Map<string, ClientSessionState>
+let mockCompleteSound: ReturnType<typeof vi.fn>
+let mockHaptic: ReturnType<typeof vi.fn>
 
 function Harness() {
   const activeSessionIdRef = useRef<string | null>(SID)
@@ -31,7 +34,6 @@ function Harness() {
       const current = sessionStateByRuntimeIdRef.current.get(sessionId) ?? createClientSessionState()
       const next = updater(current)
       sessionStateByRuntimeIdRef.current.set(sessionId, next)
-      // Mirror into the test-accessible map
       sessionStates.set(sessionId, next)
 
       return next
@@ -59,8 +61,6 @@ const complete = (text: string) =>
   act(() => handleEvent!({ payload: { text }, session_id: SID, type: 'message.complete' }))
 
 function getState(): ClientSessionState {
-  // The Harness stores state in sessionStateByRuntimeIdRef; we can't access it
-  // directly, so we capture it from the updateSessionState callback.
   return sessionStates.get(SID) ?? createClientSessionState()
 }
 
@@ -70,13 +70,23 @@ function assistantText(): string {
   return last ? chatMessageText(last) : ''
 }
 
+function assistantMessages(): string[] {
+  const state = getState()
+  return state.messages
+    .filter(m => m.role === 'assistant' && !m.hidden)
+    .map(m => chatMessageText(m))
+    .filter(Boolean)
+}
+
 describe('useMessageStream interim text sealing', () => {
   beforeEach(() => {
     handleEvent = null
+    clearSessionTodos(SID)
   })
 
   afterEach(() => {
     cleanup()
+    clearSessionTodos(SID)
     vi.restoreAllMocks()
   })
 
@@ -84,18 +94,14 @@ describe('useMessageStream interim text sealing', () => {
     await mountStream()
     await start()
 
-    // Model streams its first (interim) answer
     await delta('awaaaaa clean!! tsc zero errors')
-    // Interim callback seals it so it survives completion
     await interim('awaaaaa clean!! tsc zero errors')
 
-    // Turn completes with a different final response (e.g. after verify-on-stop)
     await complete('All checks passed.')
 
-    const text = assistantText()
-    // Both the interim text AND the final text should be present
-    expect(text).toContain('awaaaaa clean!! tsc zero errors')
-    expect(text).toContain('All checks passed.')
+    const texts = assistantMessages()
+    expect(texts).toContain('awaaaaa clean!! tsc zero errors')
+    expect(texts).toContain('All checks passed.')
   })
 
   it('dedupes interim text when the final response includes it', async () => {
@@ -105,16 +111,14 @@ describe('useMessageStream interim text sealing', () => {
     await delta('Let me check the files.')
     await interim('Let me check the files.')
 
-    // Final response repeats the interim text + adds more
     await complete('Let me check the files. Everything looks good.')
 
-    const text = assistantText()
-    // The interim text should NOT appear separately — it was folded into the final
-    expect(text).not.toContain('Let me check the files.Let me check the files.')
-    expect(text).toContain('Let me check the files. Everything looks good.')
+    const texts = assistantMessages()
+    expect(texts).not.toContain('Let me check the files.Let me check the files.')
+    expect(texts.some(t => t.includes('Let me check the files. Everything looks good.'))).toBe(true)
   })
 
-  it('clears sealed text at turn end so the next turn starts clean', async () => {
+  it('clears interimBoundaryPending at turn end so the next turn starts clean', async () => {
     await mountStream()
     await start()
 
@@ -122,12 +126,65 @@ describe('useMessageStream interim text sealing', () => {
     await interim('interim text')
     await complete('final text')
 
-    // Second turn
+    expect(getState().interimBoundaryPending).toBe(false)
+
     await start()
     await delta('new turn text')
     await complete('new turn final')
 
-    const text = assistantText()
-    expect(text).toBe('new turn final')
+    expect(assistantText()).toBe('new turn final')
+  })
+
+  it('finalizes an interim segment without settling the turn', async () => {
+    await mountStream()
+    await start()
+
+    await delta('streaming text')
+    await interim('streaming text')
+
+    // Turn is still active — busy stays true
+    expect(getState().busy).toBe(true)
+    expect(getState().interimBoundaryPending).toBe(true)
+  })
+
+  it('keeps an identical final completion distinct from an already-streamed interim reply', async () => {
+    await mountStream()
+    await start()
+
+    await interim('same reply')
+    await complete('same reply')
+
+    // Two separate assistant messages, not one collapsed
+    const texts = assistantMessages()
+    expect(texts.filter(t => t === 'same reply')).toHaveLength(2)
+  })
+
+  it('ignores malformed message.interim payload', async () => {
+    await mountStream()
+    await start()
+
+    // No payload at all
+    await act(() => handleEvent!({ type: 'message.interim' } as RpcEvent))
+    // Empty text
+    await act(() => handleEvent!({ payload: { text: '' }, session_id: SID, type: 'message.interim' } as RpcEvent))
+    // Undefined text
+    await act(() => handleEvent!({ payload: { text: undefined }, session_id: SID, type: 'message.interim' } as RpcEvent))
+
+    // Turn continues without finalizing or throwing
+    expect(getState().busy).toBe(true)
+    expect(getState().interimBoundaryPending).toBe(false)
+  })
+
+  it('clears interimBoundaryPending on message.start', async () => {
+    await mountStream()
+    await start()
+
+    await delta('interim text')
+    await interim('interim text')
+    expect(getState().interimBoundaryPending).toBe(true)
+
+    // New turn starts
+    await start()
+    expect(getState().interimBoundaryPending).toBe(false)
   })
 })

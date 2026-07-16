@@ -75,9 +75,9 @@ interface GatewayEventDeps {
   completeAssistantMessage: (sessionId: string, text: string) => void
   failAssistantMessage: (sessionId: string, errorMessage: string) => void
   flushQueuedDeltas: (sessionId?: string) => void
+  finalizeInterimAssistantMessage: (sessionId: string, text: string) => void
   queryClient: QueryClient
   refreshHermesConfig: () => Promise<void>
-  sealInterimAssistantMessage: (sessionId: string, text: string) => void
   sessionInterrupted: (sessionId: string) => boolean
   updateSessionState: (
     sessionId: string,
@@ -104,9 +104,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     completeAssistantMessage,
     failAssistantMessage,
     flushQueuedDeltas,
+    finalizeInterimAssistantMessage,
     queryClient,
     refreshHermesConfig,
-    sealInterimAssistantMessage,
     sessionInterrupted,
     updateSessionState,
     upsertToolCall
@@ -302,6 +302,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           awaitingResponse: true,
           sawAssistantPayload: false,
           interrupted: false,
+          interimBoundaryPending: false,
           turnStartedAt: Date.now()
         }))
 
@@ -315,13 +316,13 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       } else if (event.type === 'message.interim') {
         // The agent emitted interim assistant commentary (text alongside tool
         // calls, or the attempted final answer before a verify-on-stop nudge).
-        // Seal it so message.complete's replaceTextPart doesn't wipe it — the
-        // text was already streamed via message.delta and is visible to the user.
+        // Finalize it as its own sealed bubble so message.complete doesn't wipe
+        // it — the text was already streamed via message.delta and is visible.
         if (sessionId) {
           flushQueuedDeltas(sessionId)
           const text = coerceGatewayText(payload?.text)
           if (text) {
-            sealInterimAssistantMessage(sessionId, text)
+            finalizeInterimAssistantMessage(sessionId, text)
           }
         }
       } else if (event.type === 'thinking.delta') {
@@ -730,6 +731,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       compactedTurnRef,
       completeAssistantMessage,
       failAssistantMessage,
+      finalizeInterimAssistantMessage,
       flushQueuedDeltas,
       lastCwdInfoSessionRef,
       nativeSubagentSessionsRef,

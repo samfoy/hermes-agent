@@ -4754,7 +4754,9 @@ class AIAgent:
         )
         return bool(streamed) and streamed == visible_content
 
-    def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
+    def _emit_interim_assistant_message(
+        self, assistant_msg: Dict[str, Any], *, force_display: bool = False
+    ) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer."""
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
@@ -4763,7 +4765,10 @@ class AIAgent:
         visible = self._strip_think_blocks(content or "").strip()
         if not visible or visible == "(empty)":
             return
-        already_streamed = self._interim_content_was_streamed(visible)
+        already_streamed = (
+            False if force_display
+            else self._interim_content_was_streamed(visible)
+        )
         try:
             cb(visible, already_streamed=already_streamed)
         except Exception:

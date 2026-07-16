@@ -247,6 +247,8 @@ export const $workingSessionIds = atom<string[]>([])
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
 export const $messages = atom<ChatMessage[]>([])
+export const $keepInterimAssistantMessages = atom(true)
+export const setKeepInterimAssistantMessages = (v: boolean) => $keepInterimAssistantMessages.set(v)
 
 // Streaming-stable derivations of $messages. During a token stream the array
 // is replaced ~30×/s; components that only care about coarse facts (is the

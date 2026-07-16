@@ -404,6 +404,20 @@ def _load_busy_input_mode() -> str:
     return raw if raw in {"queue", "steer", "interrupt"} else "interrupt"
 
 
+def _load_interim_assistant_messages() -> bool:
+    """Return whether interim assistant commentary should be surfaced to UIs.
+
+    Honors ``display.interim_assistant_messages`` (default true). When false,
+    the tui_gateway does not install ``interim_assistant_callback``, so
+    interim text from tool-call turns and verify-on-stop candidates is never
+    emitted as ``message.interim`` — mirroring the messaging gateway's gating.
+    """
+    display = _load_cfg().get("display")
+    if not isinstance(display, dict):
+        return True
+    return is_truthy_value(display.get("interim_assistant_messages", True))
+
+
 def _notify_session_boundary(
     event_type: str, session_id: str | None, platform: str | None = None
 ) -> None:
@@ -9160,13 +9174,17 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # tool calls, or the attempted final answer before a verify-on-stop
             # nudge) so the desktop can seal it as its own segment instead of
             # losing it when message.complete replaces the streaming buffer.
-            def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-                _emit("message.interim", sid, {
-                    "text": text,
-                    "already_streamed": already_streamed,
-                })
+            # Gated on display.interim_assistant_messages (default true).
+            if _load_interim_assistant_messages():
+                def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                    _emit("message.interim", sid, {
+                        "text": text,
+                        "already_streamed": already_streamed,
+                    })
 
-            agent.interim_assistant_callback = _interim_assistant_cb
+                agent.interim_assistant_callback = _interim_assistant_cb
+            else:
+                agent.interim_assistant_callback = None
 
             run_kwargs = {
                 "conversation_history": list(history),

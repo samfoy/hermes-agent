@@ -140,11 +140,6 @@ export function useMessageStream({
   // Last session we applied a session.info cwd for — lets us tell an agent
   // relocating the SAME session (follow it) from a session switch (don't yank).
   const lastCwdInfoSessionRef = useRef<null | string>(null)
-  // Per-session set of sealed (interim) assistant text content (normalized).
-  // When the agent emits interim commentary alongside tool calls (or before a
-  // verify-on-stop nudge), that text was already streamed via message.delta —
-  // we seal it here so message.complete's replaceTextPart doesn't wipe it.
-  const sealedTextPartsRef = useRef<Map<string, Set<string>>>(new Map())
 
   const flushQueuedDeltas = useCallback(
     (sessionId?: string) => {
@@ -161,29 +156,9 @@ export function useMessageStream({
         queue.delete(id)
 
         if (queued.assistant) {
-          const sealed = sealedTextPartsRef.current.get(id)
           mutateStream(
             id,
-            parts => {
-              // If the last text part is sealed (interim), start a fresh text
-              // part so new deltas don't append to the sealed segment.
-              if (sealed && sealed.size > 0) {
-                for (let i = parts.length - 1; i >= 0; i--) {
-                  const part = parts[i]
-                  if (part.type === 'text') {
-                    const norm = part.text.replace(/\s+/g, ' ').trim()
-                    if (norm && sealed.has(norm)) {
-                      // Sealed — start a new text part after any trailing parts
-                      return dedupeGeneratedImageEchoesInParts([...parts, assistantTextPart(queued.assistant)])
-                    }
-                  }
-                  if (part.type !== 'text' && part.type !== 'reasoning') {
-                    break
-                  }
-                }
-              }
-              return dedupeGeneratedImageEchoesInParts(appendAssistantTextPart(parts, queued.assistant))
-            },
+            parts => dedupeGeneratedImageEchoesInParts(appendAssistantTextPart(parts, queued.assistant)),
             () => [assistantTextPart(queued.assistant)]
           )
         }
@@ -355,21 +330,73 @@ export function useMessageStream({
     [flushQueuedDeltas, mutateStream, sessionInterrupted]
   )
 
-  const sealInterimAssistantMessage = useCallback(
+  const finalizeInterimAssistantMessage = useCallback(
     (sessionId: string, text: string) => {
-      // Flush any pending deltas so the in-flight text part is up to date.
-      flushQueuedDeltas(sessionId)
+      updateSessionState(sessionId, state => {
+        if (state.interrupted) {
+          return state
+        }
 
-      const normalized = text.replace(/\s+/g, ' ').trim()
-      if (!normalized) {
-        return
-      }
+        const authoritativeText = renderMediaTags(text).trim()
+        if (!authoritativeText) {
+          return state
+        }
 
-      const sealed = sealedTextPartsRef.current.get(sessionId) ?? new Set<string>()
-      sealed.add(normalized)
-      sealedTextPartsRef.current.set(sessionId, sealed)
+        const streamId = state.streamId
+        const normalize = (value: string) => value.replace(/\s+/g, ' ').trim()
+
+        const replaceTextPart = (parts: ChatMessagePart[]) => {
+          const visibleText = stripGeneratedImageEchoes(
+            authoritativeText, generatedImageEchoSources(parts)
+          ).trim()
+          const dedupeReference = normalize(visibleText)
+
+          const kept = parts.filter(part => {
+            if (part.type === 'text') {
+              return false
+            }
+
+            if (part.type !== 'reasoning' || !dedupeReference) {
+              return true
+            }
+
+            const r = normalize(part.text)
+
+            return !(r && dedupeReference.startsWith(r))
+          })
+
+          return visibleText ? [...kept, assistantTextPart(visibleText)] : kept
+        }
+
+        let nextMessages = state.messages
+        if (streamId && nextMessages.some(m => m.id === streamId)) {
+          // Finalize the existing streaming bubble in place
+          nextMessages = nextMessages.map(m =>
+            m.id === streamId
+              ? { ...m, parts: replaceTextPart(m.parts), pending: false }
+              : m
+          )
+        } else {
+          // No streaming bubble — create a standalone interim message
+          nextMessages = [...nextMessages, {
+            id: `assistant-interim-${Date.now()}`,
+            role: 'assistant' as const,
+            parts: [assistantTextPart(authoritativeText)],
+            pending: false,
+            branchGroupId: state.pendingBranchGroup ?? undefined
+          }]
+        }
+
+        return {
+          ...state,
+          messages: nextMessages,
+          streamId: null,
+          interimBoundaryPending: true,
+          sawAssistantPayload: state.sawAssistantPayload || Boolean(authoritativeText)
+        }
+      })
     },
-    [flushQueuedDeltas]
+    [updateSessionState]
   )
 
   const completeAssistantMessage = useCallback(
@@ -397,7 +424,7 @@ export function useMessageStream({
         const finalText = renderMediaTags(text).trim()
         const completionError = completionErrorText(finalText)
         const normalize = (value: string) => value.replace(/\s+/g, ' ').trim()
-        const sealed = sealedTextPartsRef.current.get(sessionId)
+        const interimBoundaryPending = state.interimBoundaryPending
 
         const replaceTextPart = (parts: ChatMessagePart[]) => {
           const visibleFinalText = stripGeneratedImageEchoes(finalText, generatedImageEchoSources(parts)).trim()
@@ -405,14 +432,6 @@ export function useMessageStream({
 
           const kept = parts.filter(part => {
             if (part.type === 'text') {
-              // Keep sealed (interim) text parts unless the final response
-              // already includes them — mirrors the TUI's finalTail() dedupe.
-              if (sealed && sealed.size > 0) {
-                const norm = normalize(part.text)
-                if (norm && sealed.has(norm)) {
-                  return !(dedupeReference && (dedupeReference.startsWith(norm) || norm.startsWith(dedupeReference)))
-                }
-              }
               return false
             }
 
@@ -420,9 +439,12 @@ export function useMessageStream({
               return true
             }
 
+            // Reasoning is a restatement only when the final FULLY covers it.
+            // A short final ("Done.") must not swallow a longer reasoning block
+            // that merely starts with it (#61447).
             const r = normalize(part.text)
 
-            return !(r && (dedupeReference.startsWith(r) || r.startsWith(dedupeReference)))
+            return !(r && dedupeReference.startsWith(r))
           })
 
           return visibleFinalText ? [...kept, assistantTextPart(visibleFinalText)] : kept
@@ -465,7 +487,7 @@ export function useMessageStream({
             const existing = prev[index]
             const existingText = chatMessageText(existing).trim()
 
-            if (existing.pending || (finalText && existingText === finalText)) {
+            if (existing.pending || (!interimBoundaryPending && finalText && existingText === finalText)) {
               nextMessages = prev.map((message, messageIndex) =>
                 messageIndex === index ? completeMessage(message) : message
               )
@@ -491,13 +513,10 @@ export function useMessageStream({
           awaitingResponse: false,
           busy: false,
           needsInput: false,
+          interimBoundaryPending: false,
           turnStartedAt: null
         }
       })
-
-      // Clear sealed interim text — the turn is done, so the next turn
-      // starts with a clean slate.
-      sealedTextPartsRef.current.delete(sessionId)
 
       void refreshSessions().catch(() => undefined)
       // Sync the freshly-titled row to other windows (e.g. main, when the turn
@@ -561,11 +580,10 @@ export function useMessageStream({
           awaitingResponse: false,
           busy: false,
           needsInput: false,
+          interimBoundaryPending: false,
           turnStartedAt: null
         }
       })
-
-      sealedTextPartsRef.current.delete(sessionId)
     },
     [updateSessionState]
   )
@@ -580,9 +598,9 @@ export function useMessageStream({
     completeAssistantMessage,
     failAssistantMessage,
     flushQueuedDeltas,
+    finalizeInterimAssistantMessage,
     queryClient,
     refreshHermesConfig,
-    sealInterimAssistantMessage,
     sessionInterrupted,
     updateSessionState,
     upsertToolCall
@@ -593,7 +611,7 @@ export function useMessageStream({
     appendReasoningDelta,
     completeAssistantMessage,
     handleGatewayEvent,
-    sealInterimAssistantMessage,
+    finalizeInterimAssistantMessage,
     upsertToolCall
   }
 }
