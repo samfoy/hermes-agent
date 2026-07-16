@@ -17,7 +17,7 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write # needed by lint (PR comment) + supply-chain (PR comment)
+  pull-requests: write # needed by lint (PR comment) + supply-chain review_status
   actions: read # needed by osv-scanner (SARIF upload)
   security-events: write # needed by osv-scanner (SARIF upload)
   packages: write # needed by docker build
@@ -150,145 +150,75 @@ jobs:
     uses: ./.github/workflows/osv-scanner.yml
 
   # ─────────────────────────────────────────────────────────────────────
-  # Unified PR review comment. Two jobs manage a single comment identified
-  # by the ``<!-- hermes-ci-review-bot -->`` marker:
+  # Live-updating PR review comment.
   #
-  #   1. ``comment-pending`` — fires right after ``detect`` so the comment
-  #      appears immediately while CI is still running.
-  #   2. ``comment-results`` — fires after all review-producing sub-workflows
-  #      finish (``if: always()``), collects their outputs, assembles the
-  #      sections via ``scripts/ci/assemble_review_comment.py``, and updates
-  #      the same comment with the final content.
+  # A single ``comment-live`` job polls the GitHub Actions API every 15s
+  # for job statuses in this run, re-assembles the review comment from
+  # whatever results are available, and upserts it via the
+  # ``<!-- hermes-ci-review-bot -->`` marker.
   #
-  # The individual sub-workflows no longer post their own comments — they
-  # expose ``workflow_call`` outputs (booleans + the lockfile-diff artifact)
-  # that this job reads.
+  # The poller exits when all non-infra jobs are completed (or on
+  # timeout). ci-timings' review_status is picked up automatically when
+  # its artifact becomes available — the poller downloads and merges it.
   # ─────────────────────────────────────────────────────────────────────
-  comment-pending:
-    name: CI review comment (pending)
-    needs: detect
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork != true
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    steps:
-      - name: Post pending comment
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          set -uo pipefail
-          MARKER='<!-- hermes-ci-review-bot -->'
-          BODY="${MARKER}
-          ## ૮ >ﻌ< ა CI review
-
-          CI checks are running! this comment will be updated with results shortly."
-
-          # Find our previous comment (paginated — busy PRs exceed one page).
-          EXISTING=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
-            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" \
-            | head -1 || true)
-
-          # Comment posting is best-effort — a transient API failure should
-          # not block the gate. The comment-results job will retry.
-          if [ -n "$EXISTING" ]; then
-            echo "Updating existing comment ${EXISTING}"
-            gh api --method PATCH "repos/${REPO}/issues/comments/${EXISTING}" \
-              -f body="$BODY" > /dev/null \
-              || echo "::warning::Could not update pending PR comment (will retry in comment-results)"
-          else
-            echo "Creating new comment"
-            gh api "repos/${REPO}/issues/${PR}/comments" \
-              -f body="$BODY" > /dev/null \
-              || echo "::warning::Could not post pending PR comment (will retry in comment-results)"
-          fi
-
-  comment-results:
-    name: CI review comment (results)
-    needs: [detect, lockfile-diff, review-labels]
+  comment-live:
+    name: CI review comment (live)
+    needs: [detect, review-labels, lockfile-diff, supply-chain, osv-scanner, uv-lockfile, history-check, contributor-check]
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork != true
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 40
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Download lockfile diff artifact
-        if: needs.lockfile-diff.result == 'success'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: lockfile-diff
-          path: /tmp/artifacts/lockfile-diff
-        continue-on-error: true
-
-      - name: Assemble and post comment
+      - name: Run live comment poller
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
-          LOCKFILE_CHANGED: ${{ needs.lockfile-diff.outputs.changed }}
-          CI_REVIEW: ${{ needs.review-labels.outputs.ci_reviewed }}
-          # detect outputs tell us *which lanes ran*, so the assemble script
-          # can omit sections for lanes that were skipped (no changes in that
-          # area).  CI_REVIEW lane ran → pass the label status through.
-          # MCP_CATALOG lane ran → pass the same label status (the label
-          # gate job is shared: ci-reviewed covers both).
-          CI_REVIEW_LANE: ${{ needs.detect.outputs.ci_review }}
-          MCP_CATALOG_LANE: ${{ needs.detect.outputs.mcp_catalog }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Structured review statuses from workflow_call jobs.
+          # Each job outputs a JSON array of {source, results: [...]} objects
+          # that the assembler renders directly — no hardcoded job-name
+          # matching. We merge all available outputs into one array.
+          REVIEW_STATUSES: ${{ toJSON(needs.*.outputs.review_status) }}
         run: |
           set -uo pipefail
 
-          # Build the comment body from sub-workflow outputs.
-          LOCKFILE_DIFF_PATH="/tmp/artifacts/lockfile-diff/lockfile-diff.md"
-          # Artifact download may have been skipped (job was skipped or
-          # artifact expired) — fall back to an empty file.
-          if [ ! -f "$LOCKFILE_DIFF_PATH" ]; then
-            : > /tmp/lockfile-diff-fallback.md
-            LOCKFILE_DIFF_PATH="/tmp/lockfile-diff-fallback.md"
-          fi
+          # REVIEW_STATUSES is a JSON array of strings (some may be empty
+          # when a job was skipped). Parse each string and merge into one
+          # flat array for the assembler.
+          python3 - <<'PYEOF'
+          import json, os, sys
 
-          # Only pass the label status when the lane actually ran. If the
-          # lane was skipped (detect output was false), pass empty so the
-          # section is omitted entirely.
-          CI_REVIEW_ARG=""
-          if [ "$CI_REVIEW_LANE" = "true" ]; then
-            CI_REVIEW_ARG="$CI_REVIEW"
-          fi
-          MCP_CATALOG_ARG=""
-          if [ "$MCP_CATALOG_LANE" = "true" ]; then
-            MCP_CATALOG_ARG="$CI_REVIEW"
-          fi
+          raw = os.environ.get("REVIEW_STATUSES", "")
+          merged = []
+          if raw:
+              try:
+                  arr = json.loads(raw)
+              except (json.JSONDecodeError, TypeError):
+                  arr = []
+              for item in arr:
+                  if not item:
+                      continue
+                  try:
+                      statuses = json.loads(item)
+                  except (json.JSONDecodeError, TypeError):
+                      continue
+                  if isinstance(statuses, list):
+                      merged.extend(statuses)
 
-          python3 scripts/ci/assemble_review_comment.py \
-            --lockfile-changed "$LOCKFILE_CHANGED" \
-            --lockfile-diff "$LOCKFILE_DIFF_PATH" \
-            --ci-review "$CI_REVIEW_ARG" \
-            --mcp-catalog "$MCP_CATALOG_ARG" \
-            --output /tmp/comment-body.md
+          # Write merged array to a temp file the poller reads.
+          with open("/tmp/review_statuses.json", "w") as f:
+              json.dump(merged, f)
+          print(f"Merged {len(merged)} review status entries")
+          PYEOF
 
-          echo "Assembled comment body:"
-          cat /tmp/comment-body.md
-
-          # Find our previous comment (paginated — busy PRs exceed one page).
-          MARKER='<!-- hermes-ci-review-bot -->'
-          EXISTING=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
-            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" \
-            | head -1 || true)
-
-          # Comment posting is best-effort — never block the gate on an
-          # API call. The worst case is a stale comment that the next
-          # run will refresh.
-          if [ -n "$EXISTING" ]; then
-            echo "Updating existing comment ${EXISTING}"
-            gh api --method PATCH "repos/${REPO}/issues/comments/${EXISTING}" \
-              -F body=@/tmp/comment-body.md > /dev/null \
-              || echo "::warning::Could not update PR comment (will retry next run)"
-          else
-            echo "Creating new comment"
-            gh api "repos/${REPO}/issues/${PR}/comments" \
-              -F body=@/tmp/comment-body.md > /dev/null \
-              || echo "::warning::Could not post PR comment (will retry next run)"
-          fi
+          python3 scripts/ci/live_comment.py \
+            --interval 15 \
+            --timeout 2100 \
+            --review-statuses-file /tmp/review_statuses.json
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
@@ -296,6 +226,9 @@ jobs:
   # results cause it to fail; ``skipped`` is treated as success.
   #
   # Branch protection should require ONLY this check.
+  #
+  # Outputs ``needs-json`` — a compact ``{job_name: result}`` dict — so
+  # the live comment poller can list failed jobs in the PR comment.
   # ─────────────────────────────────────────────────────────────────────
   all-checks-pass:
     name: All required checks pass
@@ -313,20 +246,27 @@ jobs:
       - supply-chain
       - review-labels
       - osv-scanner
-      - comment-pending
-      - comment-results
+      # comment-live is a polling job — it doesn't block the gate.
       # we don't require docker to pass rn because it's so slow lol
       # - docker
     if: always()
     runs-on: ubuntu-latest
+    outputs:
+      needs-json: ${{ steps.evaluate.outputs.needs-json }}
     steps:
       - name: Evaluate job results
+        id: evaluate
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "$NEEDS" | python3 -c "
           import json, sys
           needs = json.load(sys.stdin)
+          # Emit compact {job_name: result} for the comment assembler.
+          compact = {name: info['result'] for name, info in needs.items()}
+          print(f'needs-json={json.dumps(compact)}')
+          with open('$GITHUB_OUTPUT', 'a') as f:
+              f.write(f'needs-json={json.dumps(compact)}\n')
           failed = [name for name, info in needs.items() if info['result'] == 'failure']
           for name, info in sorted(needs.items()):
               result = info['result']
@@ -343,6 +283,9 @@ jobs:
   # cache them on main (as a baseline), and on PRs generate an HTML diff
   # report with a gantt chart + per-step breakdown. The report is uploaded
   # as an artifact and a markdown summary is written to $GITHUB_STEP_SUMMARY.
+  #
+  # The live comment poller picks up ci-timings' completion automatically —
+  # it reads review-status.json from the artifact when the job finishes.
   # ─────────────────────────────────────────────────────────────────────
   ci-timings:
     name: CI timing report
@@ -372,16 +315,18 @@ jobs:
             --baseline ci-timings-baseline.json \
             --output ci-timings-report.html \
             --json-out ci-timings.json \
-            --summary-out ci-timings-summary.md
+            --summary-out ci-timings-summary.md \
+            --review-status-out review-status.json
 
-      - name: Upload HTML report
+      - name: Upload HTML report + review status
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         id: ci-timings-artifact
         with:
           name: ci-timings-report
-          path: ci-timings-report.html
+          path: |
+            ci-timings-report.html
+            review-status.json
           retention-days: 14
-          archive: false
 
       - name: Output summary
         env:

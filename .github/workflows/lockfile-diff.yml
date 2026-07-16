@@ -7,10 +7,10 @@ name: Lockfile diff
 # the ``packages`` map at the merge base and at HEAD and set-diffs the
 # {install path: version} maps instead.
 #
-# The semantic diff is exposed as a workflow_call output (boolean
-# ``changed``) and an artifact (``lockfile-diff`` containing the markdown
-# fragment) so the CI orchestrator's unified review-comment job can
-# include the section with its own header and action note.
+# The semantic diff is exposed as a workflow_call output ``review_status``
+# (a JSON array in the unified status format) and an artifact
+# (``lockfile-diff`` containing the markdown fragment) for the step
+# summary.
 #
 # Never blocking — this is review signal, not enforcement.
 
@@ -20,6 +20,9 @@ on:
       changed:
         description: Whether package-lock.json changed relative to the target branch.
         value: ${{ jobs.diff.outputs.changed }}
+      review_status:
+        description: JSON array of review status objects for the unified PR comment.
+        value: ${{ jobs.diff.outputs.review_status }}
 
 permissions:
   contents: read
@@ -35,6 +38,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       changed: ${{ steps.diff.outputs.changed }}
+      review_status: ${{ steps.emit-status.outputs.review_status }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -63,11 +67,24 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            # Write an empty placeholder so the artifact upload step always
-            # has a file to upload — downstream consumers check ``changed``
-            # before using the content.
             : > /tmp/lockfile-diff.md
           fi
+
+      - name: Emit review_status
+        id: emit-status
+        run: |
+          set -euo pipefail
+          CHANGED="${{ steps.diff.outputs.changed }}"
+          STATUS="[]"
+
+          if [ "$CHANGED" = "true" ]; then
+            CONTENT=$(cat /tmp/lockfile-diff.md | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+            STATUS="[{\"source\":\"lockfile-diff\",\"results\":[{\"kind\":\"action_required\",\"title\":\"package-lock.json\",\"summary\":\"Locked npm dependency versions changed.\",\"detail\":${CONTENT},\"how_to_fix\":\"Add the \`ci-reviewed\` label after verifying the version changes are expected.\"}]}"
+          else
+            STATUS="[{\"source\":\"lockfile-diff\",\"results\":[{\"kind\":\"info\",\"title\":\"package-lock.json\",\"summary\":\"No lockfile changes — locked versions match the target branch.\"}]}]"
+          fi
+
+          echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
 
       - name: Upload diff artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

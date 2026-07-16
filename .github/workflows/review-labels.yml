@@ -11,10 +11,10 @@ name: Review labels
 # so one label is enough — the human reads the comment, not the label
 # name.
 #
-# Outputs are tri-state: empty string when the corresponding input was
-# ``false`` (no CI-sensitive / MCP changes — section omitted from the
-# comment), ``true`` / ``false`` when the input was ``true`` (label
-# present / missing).
+# Outputs:
+#   ci_reviewed    — "true" / "false" / "" (empty when neither lane ran)
+#   review_status  — JSON array of status objects consumed by the review
+#                    comment assembler. See scripts/ci/emit_review_status.py.
 
 on:
   workflow_call:
@@ -29,8 +29,11 @@ on:
         default: false
     outputs:
       ci_reviewed:
-        description: Whether the ci-reviewed label is present. Empty when ci_review input was false.
+        description: Whether the ci-reviewed label is present. Empty when neither input was true.
         value: ${{ jobs.check.outputs.ci_reviewed }}
+      review_status:
+        description: JSON array of status objects for the review comment assembler.
+        value: ${{ jobs.check.outputs.review_status }}
 
 permissions:
   contents: read
@@ -44,7 +47,11 @@ jobs:
     timeout-minutes: 2
     outputs:
       ci_reviewed: ${{ steps.label-check.outputs.ci_reviewed }}
+      review_status: ${{ steps.build-status.outputs.review_status }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
       - name: Check ci-reviewed label
         id: label-check
         env:
@@ -62,6 +69,21 @@ jobs:
             echo "ci-reviewed label missing."
             echo "ci_reviewed=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Build review_status JSON
+        id: build-status
+        env:
+          CI_REVIEW: ${{ inputs.ci_review }}
+          MCP_CATALOG: ${{ inputs.mcp_catalog }}
+          LABEL_PRESENT: ${{ steps.label-check.outputs.ci_reviewed }}
+        run: |
+          set -euo pipefail
+          ARGS=""
+          if [ "$CI_REVIEW" = "true" ]; then ARGS="$ARGS --ci-review"; fi
+          if [ "$MCP_CATALOG" = "true" ]; then ARGS="$ARGS --mcp-catalog"; fi
+          if [ "$LABEL_PRESENT" = "true" ]; then ARGS="$ARGS --label-present"; fi
+
+          python3 scripts/ci/emit_review_status.py $ARGS --output "$GITHUB_OUTPUT"
 
       - name: Fail on missing label
         if: steps.label-check.outputs.ci_reviewed != 'true'
