@@ -1578,6 +1578,111 @@ class TestWebServerEndpoints:
         assert not get_env_value(env_var), "deleted endpoint's key still in .env"
 
 
+    def test_registered_provider_endpoint_activates_without_a_config_model(self):
+        """A plugin-backed provider must activate with no ``model:`` in config.
+
+        Plugin-registered providers (``providers/`` and ``~/.hermes/plugins/
+        model-providers/``) keep their catalog in the profile's
+        ``fallback_models``, so a valid ``providers:`` entry for one holds only
+        name/base_url/transport. ``_models_from_custom_endpoint_entry`` read
+        config.yaml only, so it returned ``[]`` and *Use* answered HTTP 400
+        "custom endpoint is incomplete" for a provider that worked in chat.
+        """
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg["providers"] = {
+            "plugin-backed": {
+                "name": "Plugin Backed",
+                "base_url": "http://127.0.0.1:8791/v1",
+                "transport": "codex_responses",
+            }
+        }
+        save_config(cfg)
+
+        fake = SimpleNamespace(
+            name="plugin-backed",
+            fallback_models=("vendor.model-a", "vendor.model-b"),
+        )
+        with patch("providers.get_provider_profile", return_value=fake):
+            listed = self.client.get("/api/providers/custom-endpoints").json()
+            entry = next(e for e in listed["endpoints"] if e["id"] == "plugin-backed")
+            assert entry["models"] == ["vendor.model-a", "vendor.model-b"]
+            assert entry["model"] == "vendor.model-a", "Default Model field was blank"
+
+            resp = self.client.post(
+                "/api/providers/custom-endpoints/plugin-backed/activate", json={}
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["model"] == "vendor.model-a"
+
+        cfg = load_config()
+        assert cfg["model"]["provider"] == "plugin-backed"
+        assert cfg["model"]["default"] == "vendor.model-a"
+        assert cfg["model"]["base_url"] == "http://127.0.0.1:8791/v1"
+
+    def test_config_model_outranks_the_registry_catalog(self):
+        """An explicit ``model:`` in config is a user decision and must win."""
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg["providers"] = {
+            "plugin-backed": {
+                "name": "Plugin Backed",
+                "base_url": "http://127.0.0.1:8791/v1",
+                "model": "user-pinned-model",
+            }
+        }
+        save_config(cfg)
+
+        fake = SimpleNamespace(
+            name="plugin-backed", fallback_models=("registry-default",)
+        )
+        with patch("providers.get_provider_profile", return_value=fake):
+            resp = self.client.post(
+                "/api/providers/custom-endpoints/plugin-backed/activate", json={}
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["model"] == "user-pinned-model"
+        assert load_config()["model"]["default"] == "user-pinned-model"
+
+    def test_unregistered_endpoint_without_a_model_names_what_is_missing(self):
+        """A genuinely incomplete endpoint still 400s, but says which field."""
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg["providers"] = {
+            "mystery": {"name": "Mystery", "base_url": "https://api.example/v1"}
+        }
+        save_config(cfg)
+
+        with patch("providers.get_provider_profile", return_value=None):
+            resp = self.client.post(
+                "/api/providers/custom-endpoints/mystery/activate", json={}
+            )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "mystery" in detail and "model" in detail
+        assert "incomplete" not in detail, "old opaque message is back"
+
+    def test_broken_provider_plugin_does_not_break_the_settings_panel(self):
+        """Provider discovery imports user plugin code; a crash must not 500."""
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg["providers"] = {
+            "plugin-backed": {"name": "PB", "base_url": "http://127.0.0.1:8791/v1"}
+        }
+        save_config(cfg)
+
+        with patch(
+            "providers.get_provider_profile", side_effect=RuntimeError("bad plugin")
+        ):
+            listed = self.client.get("/api/providers/custom-endpoints")
+        assert listed.status_code == 200
+        entry = next(e for e in listed.json()["endpoints"] if e["id"] == "plugin-backed")
+        assert entry["models"] == []
+
     def test_custom_endpoint_save_scopes_to_the_requested_profile(self):
         """``?profile=<name>`` must write into that profile's config.yaml.
 

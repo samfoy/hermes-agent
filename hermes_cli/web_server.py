@@ -7277,7 +7277,45 @@ def _custom_endpoint_id(raw: str, fallback: str = "custom") -> str:
     return slug or fallback
 
 
-def _models_from_custom_endpoint_entry(entry: Dict[str, Any]) -> List[str]:
+def _registered_provider_models(provider_id: str) -> List[str]:
+    """Return the curated catalog a *registered* provider profile advertises.
+
+    Plugin-registered providers (``providers/`` + ``~/.hermes/plugins/
+    model-providers/``) keep their catalog in the profile's ``fallback_models``,
+    not in ``config.yaml``. A ``providers:`` entry for one of them therefore
+    holds only ``name``/``base_url``/``transport`` — which is a complete and
+    correct config, not a partial one.
+
+    Returns ``[]`` for unknown providers and never raises: provider discovery
+    imports user plugin code, and a broken third-party plugin must not take
+    down the settings panel.
+    """
+    if not provider_id:
+        return []
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider_id)
+    except Exception:  # pragma: no cover - defensive around plugin imports
+        _log.debug("provider profile lookup failed for %s", provider_id, exc_info=True)
+        return []
+    if profile is None:
+        return []
+    ids = [str(m).strip() for m in (getattr(profile, "fallback_models", ()) or ())]
+    return [m for m in ids if m]
+
+
+def _models_from_custom_endpoint_entry(
+    entry: Dict[str, Any], provider_id: str = ""
+) -> List[str]:
+    """Model ids for a ``providers:`` entry, config first then the registry.
+
+    ``provider_id`` is optional so existing callers keep working, but passing it
+    is what makes plugin-backed providers resolve. Without the registry fallback,
+    an entry with no explicit ``model`` yielded an empty list, so *Use* answered
+    HTTP 400 "custom endpoint is incomplete" and the *Default Model* field
+    rendered empty for a provider that worked fine in chat.
+    """
     models: List[str] = []
     raw_models = entry.get("models")
     if isinstance(raw_models, dict):
@@ -7288,6 +7326,11 @@ def _models_from_custom_endpoint_entry(entry: Dict[str, Any]) -> List[str]:
     default_model = str(entry.get("model") or entry.get("default_model") or "").strip()
     if default_model:
         models.insert(0, default_model)
+
+    # Config wins (an explicit pin is a user decision); the registry only fills
+    # a gap it left. Order is preserved so models[0] stays the sane default.
+    if not models:
+        models.extend(_registered_provider_models(provider_id))
 
     seen: set[str] = set()
     return [model for model in models if model and not (model in seen or seen.add(model))]
@@ -7341,7 +7384,7 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             if not base_url:
                 continue
             endpoint_id = str(provider_id)
-            models = _models_from_custom_endpoint_entry(raw_entry)
+            models = _models_from_custom_endpoint_entry(raw_entry, endpoint_id)
             endpoint_model = str(raw_entry.get("model") or raw_entry.get("default_model") or (models[0] if models else ""))
             has_api_key, api_key_preview = _api_key_display(raw_entry)
             endpoints.append({
@@ -7550,11 +7593,19 @@ def activate_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
             if not isinstance(entry, dict):
                 raise HTTPException(status_code=404, detail="custom endpoint not found")
 
-            models = _models_from_custom_endpoint_entry(entry)
+            models = _models_from_custom_endpoint_entry(entry, provider_key)
             model = str(entry.get("model") or (models[0] if models else "")).strip()
             base_url = str(entry.get("base_url") or "").strip()
             if not model or not base_url:
-                raise HTTPException(status_code=400, detail="custom endpoint is incomplete")
+                # Name the missing field. The bare "incomplete" message sent
+                # users hunting through config.yaml with nothing to go on.
+                missing = " and ".join(
+                    n for n, v in (("a model", model), ("an endpoint URL", base_url)) if not v
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Custom endpoint '{provider_key}' is missing {missing}.",
+                )
 
             model_cfg = _apply_main_model_assignment(cfg.get("model", {}), provider_key, model, base_url)
             if entry.get("key_env"):
