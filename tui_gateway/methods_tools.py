@@ -482,12 +482,17 @@ def _(rid, params: dict) -> dict:
     try:
         from hermes_cli.plugins import (
             get_plugin_command_handler,
-            resolve_plugin_command_result,
+            invoke_plugin_command,
         )
 
         handler = get_plugin_command_handler(name)
         if handler:
-            result = resolve_plugin_command_result(handler(arg))
+            # Bind the dispatching session: this runs on the RPC thread pool,
+            # outside any set_session_vars scope, so a handler resolving its
+            # own session would otherwise read process-global os.environ.
+            result = invoke_plugin_command(
+                handler, arg, session_id=str(params.get("session_id", "") or "")
+            )
             return _ok(rid, {"type": "plugin", "output": str(result or "")})
     except Exception:
         pass
@@ -1155,22 +1160,29 @@ def _(rid, params: dict) -> dict:
         pass
 
     plugin_handler = None
-    resolve_plugin_command_result = None
+    invoke_plugin_command = None
     if _cmd_base:
         try:
             from hermes_cli.plugins import (
                 get_plugin_command_handler,
-                resolve_plugin_command_result,
+                invoke_plugin_command,
             )
 
             plugin_handler = get_plugin_command_handler(_cmd_base)
         except Exception:
             plugin_handler = None
-            resolve_plugin_command_result = None
+            invoke_plugin_command = None
 
-    if plugin_handler and resolve_plugin_command_result:
+    if plugin_handler and invoke_plugin_command:
         try:
-            result = resolve_plugin_command_result(plugin_handler(_cmd_arg))
+            # Bind the dispatching session (RPC thread pool has no
+            # set_session_vars scope) so per-session handler state is keyed
+            # to the session that actually typed the command.
+            result = invoke_plugin_command(
+                plugin_handler,
+                _cmd_arg,
+                session_id=str(params.get("session_id", "") or ""),
+            )
             return _ok(rid, {"output": str(result or "(no output)")})
         except Exception as e:
             return _ok(rid, {"output": f"Plugin command error: {e}"})

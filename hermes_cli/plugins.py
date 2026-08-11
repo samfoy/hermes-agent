@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -2773,9 +2774,17 @@ def resolve_plugin_command_result(result: Any) -> Any:
     failure: Dict[str, BaseException] = {}
     done = threading.Event()
 
+    # Carry the caller's ContextVars (notably the session key bound by
+    # invoke_plugin_command) into the helper thread. ContextVars do NOT
+    # propagate across threads on their own, so without this an async handler
+    # that resolves its session via get_session_env would read whatever the
+    # process-global env holds — the exact cross-session leak this binding
+    # exists to prevent.
+    ctx = contextvars.copy_context()
+
     def _runner() -> None:
         try:
-            outcome["value"] = asyncio.run(result)
+            outcome["value"] = ctx.run(asyncio.run, result)
         except BaseException as exc:  # pragma: no cover - re-raised below
             failure["exc"] = exc
         finally:
@@ -2795,6 +2804,63 @@ def resolve_plugin_command_result(result: Any) -> Any:
     if "exc" in failure:
         raise failure["exc"]
     return outcome.get("value")
+
+
+def invoke_plugin_command(
+    handler: Callable,
+    raw_args: str,
+    session_id: str = "",
+) -> Any:
+    """Call a plugin slash-command handler with its dispatching session bound.
+
+    Every surface (CLI, gateway, TUI, WebUI) dispatches plugin commands outside
+    the per-turn ``set_session_vars`` scope, so a handler asking "which session
+    am I?" used to fall back to process-global ``os.environ`` — in a
+    multi-session host that is whatever session last wrote it. A mode toggled
+    in session B could then be recorded against session A.
+
+    Two mechanisms, both optional so existing handlers keep working:
+
+    * ``session_id`` is passed as a keyword **only** when the handler declares
+      it (or accepts ``**kwargs``), inspected via :mod:`inspect`.
+    * The key is bound as a task-local ContextVar for the duration of the call,
+      so handlers that resolve it through ``get_session_env`` see the right
+      value without changing their signature.
+
+    Async handlers are resolved via :func:`resolve_plugin_command_result`.
+    Note the ContextVar binding does not follow work onto a *different* thread,
+    so handlers must read the key on the calling thread; the explicit
+    ``session_id`` kwarg is the robust path and is preferred for new handlers.
+    """
+    pass_session = False
+    if session_id:
+        try:
+            params = inspect.signature(handler).parameters
+            pass_session = "session_id" in params or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except (TypeError, ValueError):
+            # Builtins / C callables expose no signature; fall back to the
+            # ContextVar binding rather than risking a TypeError.
+            pass_session = False
+
+    def _call() -> Any:
+        if pass_session:
+            return handler(raw_args, session_id=session_id)
+        return handler(raw_args)
+
+    if not session_id:
+        return resolve_plugin_command_result(_call())
+
+    try:
+        from gateway.session_context import scoped_session_key
+    except Exception:
+        return resolve_plugin_command_result(_call())
+
+    with scoped_session_key(session_id):
+        # Resolve inside the scope so async handlers awaited on this thread
+        # still observe the bound key.
+        return resolve_plugin_command_result(_call())
 
 
 def get_plugin_commands() -> Dict[str, dict]:

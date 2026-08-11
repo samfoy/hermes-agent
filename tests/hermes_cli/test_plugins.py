@@ -1211,6 +1211,119 @@ class TestPluginCommandResultResolution:
             resolve_plugin_command_result(_slow_handler())
 
 
+class TestInvokePluginCommandSessionBinding:
+    """Plugin command handlers must learn WHICH session dispatched them.
+
+    Slash commands are dispatched outside the per-turn set_session_vars scope,
+    so a handler resolving its own session used to read process-global
+    os.environ — in a multi-session host that is whichever session last ran a
+    turn. A mode toggled in session B was recorded against session A.
+    """
+
+    def test_passes_session_id_when_handler_declares_it(self):
+        from hermes_cli.plugins import invoke_plugin_command
+
+        seen = {}
+
+        def _handler(raw_args, session_id=""):
+            seen["args"] = raw_args
+            seen["sid"] = session_id
+            return "ok"
+
+        assert invoke_plugin_command(_handler, "on", session_id="sess-B") == "ok"
+        assert seen == {"args": "on", "sid": "sess-B"}
+
+    def test_passes_session_id_via_var_keyword(self):
+        from hermes_cli.plugins import invoke_plugin_command
+
+        seen = {}
+
+        def _handler(raw_args, **kwargs):
+            seen.update(kwargs)
+            return "ok"
+
+        invoke_plugin_command(_handler, "", session_id="sess-C")
+        assert seen.get("session_id") == "sess-C"
+
+    def test_legacy_one_arg_handler_is_not_broken(self):
+        """A handler that never declared session_id must still be callable."""
+        from hermes_cli.plugins import invoke_plugin_command
+
+        def _legacy(raw_args):
+            return f"got:{raw_args}"
+
+        assert invoke_plugin_command(_legacy, "x", session_id="sess-D") == "got:x"
+
+    def test_legacy_handler_sees_bound_contextvar(self):
+        """Legacy handlers resolve the session through the ContextVar instead."""
+        from hermes_cli.plugins import invoke_plugin_command
+        from gateway.session_context import get_session_env
+
+        seen = {}
+
+        def _legacy(raw_args):
+            seen["sid"] = get_session_env("HERMES_SESSION_KEY", "")
+            return "ok"
+
+        invoke_plugin_command(_legacy, "", session_id="sess-E")
+        assert seen["sid"] == "sess-E"
+
+    def test_contextvar_is_restored_after_the_call(self):
+        from hermes_cli.plugins import invoke_plugin_command
+        from gateway.session_context import get_session_env, scoped_session_key
+
+        def _handler(raw_args):
+            return get_session_env("HERMES_SESSION_KEY", "")
+
+        with scoped_session_key("outer-session"):
+            assert invoke_plugin_command(_handler, "", session_id="inner") == "inner"
+            # The outer binding must survive the nested dispatch.
+            assert get_session_env("HERMES_SESSION_KEY", "") == "outer-session"
+
+    def test_async_handler_still_resolved(self):
+        from hermes_cli.plugins import invoke_plugin_command
+
+        async def _handler(raw_args, session_id=""):
+            return f"async:{session_id}"
+
+        assert invoke_plugin_command(_handler, "", session_id="sess-F") == "async:sess-F"
+
+    def test_legacy_async_handler_on_threaded_path_sees_bound_session(
+        self, monkeypatch
+    ):
+        """ContextVars must reach the helper thread, not just the caller.
+
+        resolve_plugin_command_result runs async handlers in a helper thread
+        when a loop is already running. ContextVars do not cross threads by
+        default, so a legacy async handler resolving its session through
+        get_session_env used to read process-global env there — reintroducing
+        the cross-session leak on exactly the WebUI/gateway path that matters.
+        """
+        import hermes_cli.plugins as plugins
+        from gateway.session_context import get_session_env
+
+        class _Loop:
+            pass
+
+        # Force the threaded branch.
+        monkeypatch.setattr(plugins.asyncio, "get_running_loop", lambda: _Loop())
+        monkeypatch.setenv("HERMES_SESSION_KEY", "stale-process-global")
+
+        seen = {}
+
+        async def _legacy_async(raw_args):
+            seen["sid"] = get_session_env("HERMES_SESSION_KEY", "")
+            return "done"
+
+        result = plugins.invoke_plugin_command(
+            _legacy_async, "", session_id="sess-threaded"
+        )
+        assert result == "done"
+        assert seen["sid"] == "sess-threaded", (
+            "session key did not propagate into the await helper thread"
+        )
+
+
 # ── TestPluginDispatchTool ────────────────────────────────────────────────
 
 

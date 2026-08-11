@@ -195,6 +195,31 @@ def set_current_session_id(session_id: str) -> None:
 
 
 @contextmanager
+def scoped_session_key(session_key: str | None = None) -> Iterator[None]:
+    """Bind a task-local session key and restore the prior value on exit.
+
+    Slash-command handlers registered by plugins run outside the per-turn
+    ``set_session_vars`` scope: the CLI, gateway, TUI, and WebUI all dispatch
+    them directly. A handler that resolves "which session am I?" through
+    ``get_session_env("HERMES_SESSION_KEY")`` therefore fell back to
+    process-global ``os.environ``, which in a multi-session host is whatever
+    session last wrote it — so a toggle typed in session B could be recorded
+    against session A while A was mid-turn.
+
+    Wrap plugin command dispatch in this to bind the *dispatching* session's
+    key for the duration of the handler. Never mutates ``os.environ``: the
+    ContextVar is task-local and safe for concurrent sessions.
+    """
+    previous = _SESSION_KEY.get()
+    if session_key is not None:
+        _SESSION_KEY.set(session_key)
+    try:
+        yield
+    finally:
+        _SESSION_KEY.set(previous)
+
+
+@contextmanager
 def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
     """Bind a task-local session id and restore the prior value on exit.
 
