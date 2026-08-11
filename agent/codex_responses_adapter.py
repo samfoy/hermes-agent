@@ -16,6 +16,7 @@ import logging
 import re
 import unicodedata
 import uuid
+from collections import Counter
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -55,6 +56,68 @@ def _classify_responses_issuer(
 # Throttle the per-process cross-issuer skip warning so we don't flood logs
 # when a long history contains many stale-issuer reasoning blocks.
 _CROSS_ISSUER_WARN_EMITTED = False
+
+
+# Runaway low-entropy output: gpt-5.x on the Responses API sometimes
+# degenerates into a repeated token instead of composing its answer. The
+# observed instance (session b07427f45039, 2026-08-11) emitted 103,088
+# characters that decomposed to a single "}", 1,137 lines of "!", and 77,747
+# blank lines -- 78,885 lines with NOT ONE line longer than 12 characters.
+#
+# This is the same root cause and the same consequence as the Harmony
+# ``to=functions.`` leak below: the model failed to produce a real turn, and
+# passing the text through publishes garbage while the turn never finalizes
+# (that row persisted with finish_reason=NULL).
+#
+# Detection is STRUCTURAL, never a length cap. Real answers are legitimately
+# long -- the largest genuine assistant message measured on this install is
+# 17,233 characters with 68 prose lines -- so size alone cannot separate them.
+# What separates them is the total ABSENCE of prose: a degenerate stream has
+# zero lines of real text, while a 17KB answer has dozens.
+#
+# Measured against every assistant message >400 chars in the local session DB
+# (3,197 messages: 16 GPT/Mantle + 3,181 other): this predicate matched
+# exactly 1 -- the defect -- and 0 legitimate messages. Re-audit that number
+# before loosening any threshold here.
+_RUNAWAY_MIN_LINES = 50          # below this a terse reply is plausible
+_RUNAWAY_PROSE_MIN_CHARS = 12    # a "prose line" is longer than this
+_RUNAWAY_DOMINANCE = 0.5         # one token is >=50% of non-blank lines
+_RUNAWAY_BLANK_RATIO = 0.9       # ...or the message is >=90% blank padding
+
+
+def _is_runaway_degenerate_text(text: str) -> bool:
+    """True when assistant text is a degenerate token stream, not an answer.
+
+    Requires ALL of:
+      * more than ``_RUNAWAY_MIN_LINES`` lines, and
+      * zero lines longer than ``_RUNAWAY_PROSE_MIN_CHARS`` (no prose), and
+      * a single repeated line dominating the non-blank lines, or the message
+        being overwhelmingly blank padding.
+
+    Never raises: a non-string or unparseable value is reported as clean so
+    the caller's behaviour is unchanged (fail toward the pre-existing path).
+    """
+    try:
+        if not isinstance(text, str):
+            return False
+        lines = text.splitlines()
+        if len(lines) <= _RUNAWAY_MIN_LINES:
+            return False
+        stripped = [line.strip() for line in lines]
+        non_blank = [line for line in stripped if line]
+        # A real answer always carries at least one substantial line.
+        for line in non_blank:
+            if len(line) > _RUNAWAY_PROSE_MIN_CHARS:
+                return False
+        if not non_blank:
+            # Nothing but whitespace across many lines is itself degenerate.
+            return True
+        blank_ratio = 1.0 - (len(non_blank) / len(lines))
+        dominance = Counter(non_blank).most_common(1)[0][1] / len(non_blank)
+        return dominance >= _RUNAWAY_DOMINANCE or blank_ratio >= _RUNAWAY_BLANK_RATIO
+    except Exception:
+        logger.debug("runaway-degeneration check failed", exc_info=True)
+        return False
 
 
 # Matches Codex/Harmony tool-call serialization that occasionally leaks into
@@ -1537,6 +1600,28 @@ def _normalize_codex_response(
         # so the model keeps its chain-of-thought on the retry.
         final_text = ""
 
+    # ── Runaway degeneration recovery ────────────────────────────
+    # Sibling of the leak guard above, for the other observed gpt-5.x
+    # degeneration shape: a repeated token instead of an answer. Handled the
+    # same way and for the same reason -- the model produced no real turn, so
+    # re-eliciting beats publishing 100KB of "!" and never finalizing.
+    #
+    # Deliberately checked AFTER the leak guard: leaked tool-call text is the
+    # more specific diagnosis and owns the warning when both could match.
+    runaway_degenerate_text = False
+    if final_text and not tool_calls and _is_runaway_degenerate_text(final_text):
+        runaway_degenerate_text = True
+        logger.warning(
+            "Codex response degenerated into a repeated-token stream "
+            "(%d chars, %d lines, no prose). Treating as incomplete so the "
+            "continuation path can re-elicit a real answer. Head: %r",
+            len(final_text),
+            len(final_text.splitlines()),
+            final_text[:120],
+        )
+        # Same rationale as the leak guard: drop the garbage, keep reasoning.
+        final_text = ""
+
     # ── Reasoning-channel answer salvage (xAI grok) ──────────────
     # grok-4.x on the xAI /v1/responses surface sometimes emits its final
     # answer inside the reasoning item instead of as a ``message`` output
@@ -1591,6 +1676,8 @@ def _normalize_codex_response(
     elif response_incomplete_content_filter:
         finish_reason = "content_filter"
     elif leaked_tool_call_text:
+        finish_reason = "incomplete"
+    elif runaway_degenerate_text:
         finish_reason = "incomplete"
     elif saw_streaming_or_item_incomplete:
         finish_reason = "incomplete"
