@@ -748,6 +748,121 @@ def _crop_image_region(
         return None, None, f"Failed to crop region: {exc}"
 
 
+def _log_empty_vision_response(stage: str, response: Any) -> None:
+    """Record the diagnostic shape of an empty vision response.
+
+    An empty vision result is a successful API call that produced no visible
+    text, so nothing raises and nothing is logged by default — the failure is
+    invisible in the journal, which is what made this hard to attribute. Log the
+    fields that distinguish the failure mode:
+
+      * ``finish_reason='stop'`` with ``content=None`` — the model ended the turn
+        cleanly having emitted no ``output_text`` item.
+      * ``usage=None`` — observed on the empty responses and never on the
+        successful ones, so it is the cheapest positive signal.
+
+    Never raises: diagnostics must not be able to break the tool they instrument.
+    """
+    try:
+        choices = getattr(response, "choices", None) or []
+        first = choices[0] if choices else None
+        msg = getattr(first, "message", None) if first is not None else None
+        usage = getattr(response, "usage", None)
+        logger.warning(
+            "vision empty response (%s): type=%s finish_reason=%r "
+            "content=%r reasoning=%r choices=%d usage=%s model=%r",
+            stage,
+            type(response).__name__,
+            getattr(first, "finish_reason", None) if first is not None else None,
+            getattr(msg, "content", None) if msg is not None else None,
+            bool(getattr(msg, "reasoning", None)) if msg is not None else None,
+            len(choices),
+            "present" if usage is not None else "None",
+            getattr(response, "model", None),
+        )
+    except Exception:
+        logger.debug("vision empty-response logging failed", exc_info=True)
+
+
+async def _retry_vision_on_fallback_backend(
+    call_kwargs: dict,
+    *,
+    model_override: Optional[str] = None,
+) -> tuple:
+    """Retry a vision call on a DIFFERENT backend than the one that just failed.
+
+    Returns ``(analysis, provider)``; ``("", None)`` when no distinct backend is
+    available or every candidate also came back empty.
+
+    Backends come from ``get_available_vision_backends()`` (the single source of
+    truth for vision auto-routing) rather than a hardcoded list, so a host with
+    no second backend degrades to a clean failure instead of a confident wrong
+    answer. The provider that already failed is skipped — retrying it here would
+    just repeat the same empty response a third time.
+
+    Any per-candidate exception is swallowed and the next candidate is tried: we
+    are already on the failure path, and the caller reports honest failure if
+    nothing works.
+    """
+    try:
+        from agent.auxiliary_client import (
+            get_available_vision_backends,
+            resolve_vision_provider_client,
+        )
+    except Exception:
+        logger.debug("vision fallback: auxiliary client import failed", exc_info=True)
+        return "", None
+
+    # Use the MODULE-LEVEL ``async_call_llm`` / ``extract_content_or_reasoning``
+    # rather than re-importing them from agent.auxiliary_client. Both are
+    # deliberately kept as attributes of this module (see _load_auxiliary_client)
+    # precisely so callers and tests can patch ``tools.vision_tools.<name>``.
+    # Re-importing would bypass an injected mock and, worse, silently diverge
+    # from the client the primary call actually used.
+    _load_auxiliary_client()
+
+    # Which provider just failed? Resolve it the same way the primary call did
+    # so the comparison is against the provider actually used, not the config.
+    failed_provider = None
+    try:
+        failed_provider, _client, _model = resolve_vision_provider_client(
+            model=model_override or None,
+        )
+    except Exception:
+        logger.debug("vision fallback: could not resolve primary provider", exc_info=True)
+
+    try:
+        candidates = get_available_vision_backends() or []
+    except Exception:
+        logger.debug("vision fallback: backend enumeration failed", exc_info=True)
+        return "", None
+
+    for provider in candidates:
+        if failed_provider and provider == failed_provider:
+            continue
+        # The primary model name belongs to the primary provider; let the
+        # fallback provider pick its own default vision model.
+        fb_kwargs = {k: v for k, v in call_kwargs.items() if k != "model"}
+        fb_kwargs["provider"] = provider
+        logger.warning(
+            "vision: primary backend %r returned empty twice; retrying on %r",
+            failed_provider, provider,
+        )
+        try:
+            resp = await async_call_llm(**fb_kwargs)
+            analysis = extract_content_or_reasoning(resp)
+            if analysis:
+                return analysis, provider
+            _log_empty_vision_response(f"fallback backend {provider}", resp)
+        except Exception as exc:
+            logger.warning(
+                "vision fallback backend %r failed: %s: %s",
+                provider, type(exc).__name__, exc,
+            )
+
+    return "", None
+
+
 def _build_scale_note(
     scale_info: Optional[dict],
     crop_offset: Optional[dict],
@@ -1531,18 +1646,54 @@ async def vision_analyze_tool(
         # Extract the analysis — fall back to reasoning if content is empty
         analysis = extract_content_or_reasoning(response)
 
-        # Retry once on empty content (reasoning-only response)
+        # An empty-content response is a SUCCESSFUL API call that produced no
+        # visible text (``finish_reason='stop'``, ``content=None``, ``usage=None``).
+        # Reasoning-heavy models on the Codex/Responses transport do this
+        # intermittently: the turn ends having emitted no ``output_text`` item.
+        # Measured on bedrock-mantle / openai.gpt-5.6-sol, 2026-08-11.
         if not analysis:
+            _log_empty_vision_response("first attempt", response)
             logger.warning("Vision LLM returned empty content, retrying once")
             response = await async_call_llm(**call_kwargs)
             analysis = extract_content_or_reasoning(response)
+            if not analysis:
+                _log_empty_vision_response("retry", response)
+
+        # Same-provider retry also came back empty. Retrying the same backend a
+        # third time is unlikely to help, but a DIFFERENT vision backend usually
+        # answers fine — the failure is per-provider, not per-image. This is the
+        # common case when the main model is a reasoning model on a Responses
+        # proxy while a vision-capable Claude backend sits right there unused.
+        if not analysis:
+            analysis, _fb_provider = await _retry_vision_on_fallback_backend(
+                call_kwargs, model_override=model,
+            )
+            if analysis:
+                logger.info(
+                    "Vision recovered via fallback backend %r after empty "
+                    "responses from the primary backend", _fb_provider,
+                )
+
+        # Still nothing. Report FAILURE rather than a canned apology wrapped in
+        # success=True: a caller that sees success=True will treat the string as
+        # a real reading of the image and reason from it. Fail closed instead.
+        if not analysis:
+            _err = (
+                "Vision model returned no visible text after a same-backend "
+                "retry and a fallback-backend attempt. The API calls succeeded "
+                "but produced no output text, so the image was NOT read. "
+                "Do not treat this as a description of the image."
+            )
+            logger.error("vision_analyze: %s", _err)
+            debug_call_data["success"] = False
+            debug_call_data["error"] = "empty_vision_response"
+            _debug.log_call("vision_analyze_tool", debug_call_data)
+            return tool_error(_err, success=False)
 
         analysis_length = len(analysis)
-        
+
         logger.info("Image analysis completed (%s characters)", analysis_length)
-        
-        # Prepare successful response
-        analysis = analysis or "There was a problem with the request and the image could not be analyzed."
+
         scale_note = _build_scale_note(
             _scale_info or None, _crop_offset or None,
         )
