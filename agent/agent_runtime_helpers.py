@@ -3622,6 +3622,110 @@ def intent_ack_continuation_enabled(agent) -> bool:
     return intent_ack_continuation_mode(agent) != "off"
 
 
+# ── Post-tool promissory-stop detection ─────────────────────────────────────
+#
+# Complement of ``looks_like_codex_intermediate_ack``: that detector requires
+# the turn to contain NO tool messages (start-of-turn ack), so it can never
+# catch the observed Responses-API defect where a mid-task progress note gets
+# stamped ``phase='final_answer'`` AFTER a tool round and terminates the turn
+# ("The browser render completed, but my verification snippet had a syntax
+# error. I will rerun the check with the fixed parser." → turn ends, user must
+# type "continue").  The phase mislabel is model-side and unreachable from
+# here; this makes it non-fatal by detecting the *shape* of the leaked note —
+# a short, first-person promise of an immediate next action, ending a turn
+# that just executed tools.
+#
+# Measured against every recorded turn-ending assistant message in state.db
+# (2026-08-11): 4,212 stop-messages with visible text and no tool calls, of
+# which 88 were on the codex/Responses path.  The full predicate (post-tool +
+# length cap + exclusions + promissory tail) fired on exactly 3 of the 88 —
+# all three confirmed defects (ids 126162, 133517, 136646) — and 0 false
+# positives.  The plain (chat-completions) population contained 4
+# promissory-looking but LEGITIMATE stops (waiting on delegated agents /
+# asking the user to run mwinit), which is why the conversation-loop call
+# site additionally gates on ``api_mode == "codex_responses"``.
+
+# First-person promise of an immediate future action near the end of the
+# reply: "I will rerun the check", "I am now ranking by severity", "I'll fix
+# the parser and re-check".  The negative lookahead keeps declinations
+# ("I will not relocate ...") from matching.
+_PROMISSORY_TAIL_RE = re.compile(
+    r"\b(?:i\s+will(?!\s+not\b)|i['\u2019]ll(?!\s+not\b)|"
+    r"i\s+am\s+(?:now\s+)?going\s+to|i\s+am\s+now)\b"
+    r"[^.?!\n]{0,140}?"
+    r"\b(?:re-?run(?:ning)?|retry(?:ing)?|re-?check(?:ing)?|continu(?:e|ing)|"
+    r"proceed(?:ing)?|run(?:ning)?|check(?:ing)?|verify(?:ing)?|fix(?:ing)?|"
+    r"updat(?:e|ing)|apply(?:ing)?|investigat(?:e|ing)|inspect(?:ing)?|"
+    r"rebuild(?:ing)?|publish(?:ing)?|rank(?:ing)?|clean(?:ing)?)\b",
+    re.IGNORECASE,
+)
+
+# Language that marks the stop as legitimate even though it sounds
+# promissory: waiting on background/delegated work that re-enters on its own,
+# asking the user for something, an explicit time horizon, or a promise
+# deferred to a later day/cadence ("I will check back tomorrow", "I will
+# rerun periodically") — those are routine follow-up mentions on a completed
+# turn, not a stalled task.  Every phrase here comes from a real
+# false-positive candidate found in the corpus sweep or the adversarial
+# review, not from imagination.
+_PROMISSORY_EXCLUDE_RE = re.compile(
+    r"\b(?:wait(?:ing)?|holding|hold\b|standing\s+by|notification|wake\s+me|"
+    r"let\s+me\s+know|can\s+you|could\s+you|when\s+you\s+ask|check\s+again|"
+    r"check\s+back|come\s+back|monitor(?:ing)?|queued|tmux|background|"
+    r"still\s+running|in\s+progress|"
+    r"builder|sub-?agent|coding\s+agent|critic\b|delegat|auto-chained|"
+    r"keep\s+going|"
+    r"tomorrow|tonight|overnight|periodically|later\s+today|next\s+week|"
+    r"follow-?up|smoke\s+test)\b"
+    r"|\b(?:when|once|after)\b[^.?!\n]{0,80}\b(?:returns?|completes?|finishes|lands?|runs?)\b"
+    r"|~\s*\d+\s*(?:min|hour|hr)",
+    re.IGNORECASE,
+)
+
+# A real final answer is usually long; every observed defect was a one-or-two
+# sentence note (99–206 chars).  600 leaves headroom without admitting full
+# summaries.
+_PROMISSORY_MAX_LEN = 600
+# Promise must be near the END of the text — an opening "I'll fix X" followed
+# by a delivered answer is not a dangling promise.
+_PROMISSORY_TAIL_WINDOW = 240
+
+
+def looks_like_post_tool_promissory_stop(
+    agent,
+    assistant_content: Any,
+    messages: List[Dict[str, Any]],
+) -> bool:
+    """Detect a turn-ending reply that promises an immediate action it never took.
+
+    Fires only when the immediately preceding message is a tool result (the
+    turn just executed tools), the visible text is short, does not ask the
+    user anything, does not reference waiting on background/delegated work,
+    and ends on a first-person future-action promise.  On any unexpected
+    content shape this returns ``False`` — failing toward the pre-existing
+    terminate behaviour, never a crash (``assistant_content`` can be a list
+    of blocks on multimodal replies; ``_strip_think_blocks`` coerces).
+    """
+    if (
+        not messages
+        or not isinstance(messages[-1], dict)
+        or messages[-1].get("role") != "tool"
+    ):
+        return False
+    try:
+        text = agent._strip_think_blocks(assistant_content or "").strip()
+    except Exception:
+        logger.debug("promissory-stop text extraction failed", exc_info=True)
+        return False
+    if not text or len(text) > _PROMISSORY_MAX_LEN:
+        return False
+    if text.rstrip().endswith("?"):
+        return False
+    if _PROMISSORY_EXCLUDE_RE.search(text):
+        return False
+    return bool(_PROMISSORY_TAIL_RE.search(text[-_PROMISSORY_TAIL_WINDOW:]))
+
+
 
 
 def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> None:

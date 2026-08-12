@@ -4605,6 +4605,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX,
             _LENGTH_CONTINUATION_NETWORK_STUB,
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
+            _PROMISSORY_STOP_CONTINUATION_NUDGE,
         )
 
         return text in {
@@ -4617,6 +4618,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             _EMPTY_TOOL_RESPONSE_NUDGE,
             _LENGTH_CONTINUATION_NETWORK_STUB,
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
+            _PROMISSORY_STOP_CONTINUATION_NUDGE,
         } or text.startswith(
             TODO_INJECTION_HEADER + "\n"
         ) or text.startswith(

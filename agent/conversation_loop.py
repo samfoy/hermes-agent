@@ -886,6 +886,19 @@ _CODEX_ACK_CONTINUATION_NUDGE = (
     "send your final answer after completing the task.]"
 )
 
+# Re-prompt sent when a Responses-API turn ends on a short post-tool progress
+# note that promises an immediate next action ("I will rerun the check with
+# the fixed parser.") — the observed gpt-5.x phase-mislabel defect where
+# mid-task narration gets stamped phase='final_answer' and terminates the
+# turn.  Named for the same compression-recognition reason as
+# _CODEX_ACK_CONTINUATION_NUDGE.
+_PROMISSORY_STOP_CONTINUATION_NUDGE = (
+    "[System: Your previous message promised an immediate next action but "
+    "ended the turn without taking it. Take that action now via the "
+    "appropriate tool call, and only send your final answer once the task "
+    "is complete.]"
+)
+
 # Re-prompt sent when a provider returns finish_reason="tool_calls" with an
 # empty tool_calls array (dropped-tool-call recovery, see the retry loop
 # below). Named for the same reason as _CODEX_ACK_CONTINUATION_NUDGE — this
@@ -1624,6 +1637,7 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    promissory_stop_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
@@ -7410,6 +7424,7 @@ def run_conversation(
 
                 from agent.agent_runtime_helpers import (
                     intent_ack_continuation_mode,
+                    looks_like_post_tool_promissory_stop,
                 )
 
                 _ack_mode = intent_ack_continuation_mode(agent)
@@ -7442,6 +7457,58 @@ def run_conversation(
                     continue
 
                 codex_ack_continuations = 0
+
+                # ── Post-tool promissory-stop continuation ──────────
+                # The intent-ack block above only handles start-of-turn acks
+                # (its detector requires zero tool messages in the turn), so a
+                # Responses-API turn that executed tools and then ended on a
+                # short "I will rerun the check with the fixed parser."
+                # progress note terminates and the user has to type
+                # "continue".  Root cause: the model stamps mid-task narration
+                # phase='final_answer' (model-side, unfixable here).  Detect
+                # the promissory shape and nudge once, exactly like the
+                # intent-ack path.  Scoped to codex_responses because that is
+                # where phase alone decides termination AND where the corpus
+                # sweep measured 3/88 hits with zero false positives — the
+                # chat-completions population contained legitimate
+                # promissory-sounding stops (waiting on delegated agents,
+                # asking the user to run a command).  Cost of a false
+                # positive is one extra round-trip; cost of a miss is a dead
+                # turn.  Capped at 2 per turn so a model that keeps promising
+                # without acting cannot loop forever.
+                if (
+                    agent.api_mode == "codex_responses"
+                    and agent.valid_tool_names
+                    and promissory_stop_continuations < 2
+                    and looks_like_post_tool_promissory_stop(
+                        agent, final_response, messages
+                    )
+                ):
+                    promissory_stop_continuations += 1
+                    logger.info(
+                        "Post-tool promissory stop detected — nudging to "
+                        "continue (%d/2): %.120s",
+                        promissory_stop_continuations,
+                        str(final_response),
+                    )
+                    agent._emit_status(
+                        "↻ Turn ended on a promised action — nudging model "
+                        f"to continue ({promissory_stop_continuations}/2)"
+                    )
+                    interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
+                    messages.append(interim_msg)
+                    agent._emit_interim_assistant_message(interim_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": _PROMISSORY_STOP_CONTINUATION_NUDGE,
+                    })
+                    agent._session_messages = messages
+                    # The promissory note is explicitly non-final — same
+                    # contract as the intent-ack continuation above.
+                    final_response = None
+                    continue
+
+                promissory_stop_continuations = 0
 
                 if truncated_response_parts:
                     final_response = _join_truncated_parts([*truncated_response_parts, final_response])
