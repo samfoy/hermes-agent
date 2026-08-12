@@ -168,6 +168,24 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
 # tests cannot drift from the injection sites.
 EMPTY_RESPONSE_SENTINEL = "(empty)"
 
+# Prefix matcher for a leaked sentinel, derived FROM the constant above so the
+# two cannot drift.
+#
+# Case- and spacing-tolerant because the leak is the model paraphrasing our
+# sentinel, not echoing it byte-for-byte. Observed in the wild (2026-08-12,
+# gpt-5.6-sol, message id 139882): "(Empty again? Need tool call)" — capital E,
+# which a literal ``startswith("(empty)")`` misses. The word after "(" is
+# anchored so this stays a PREFIX match: an answer that merely mentions the
+# sentinel ("`(empty)` is the sentinel Hermes injects") must still end the turn.
+#
+# Measured over all 4,589 real assistant turn-enders carrying content in
+# state.db: the literal prefix matched 6, this pattern matches 7 — the 6 plus
+# the leak above, and no legitimate answer.
+_LEAKED_SENTINEL_PREFIX_RE = re.compile(
+    r"\(\s*" + re.escape(EMPTY_RESPONSE_SENTINEL.strip("()")) + r"\b",
+    re.IGNORECASE,
+)
+
 # Content part types that are NOT visible assistant prose.
 # ``flatten_message_text`` deliberately keeps reasoning parts (callers use it to
 # recover text from any shape) and its key list includes the generic ``content``
@@ -7093,7 +7111,7 @@ def run_conversation(
                 # whose visible answer was perfectly good.
                 _visible_final = _visible_text_for_sentinel_check(final_response)
                 _leaked_empty_sentinel = (
-                    _visible_final.lstrip().startswith(EMPTY_RESPONSE_SENTINEL)
+                    bool(_LEAKED_SENTINEL_PREFIX_RE.match(_visible_final.lstrip()))
                     and agent._has_content_after_think_block(final_response)
                 )
                 if (
@@ -7207,7 +7225,7 @@ def run_conversation(
                         # Without this, we'd have tool → user which most
                         # APIs reject as an invalid sequence.
                         _nudge_msg = agent._build_assistant_message(assistant_message, finish_reason)
-                        _nudge_msg["content"] = "(empty)"
+                        _nudge_msg["content"] = EMPTY_RESPONSE_SENTINEL
                         _nudge_msg["_empty_recovery_synthetic"] = True
                         messages.append(_nudge_msg)
                         messages.append({
@@ -7354,7 +7372,7 @@ def run_conversation(
                     reasoning_text = agent._extract_reasoning(assistant_message)
                     agent._drop_trailing_empty_response_scaffolding(messages)
                     assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
-                    assistant_msg["content"] = "(empty)"
+                    assistant_msg["content"] = EMPTY_RESPONSE_SENTINEL
                     # This is a user-facing failure sentinel for the gateway,
                     # not real assistant content. Persisting it makes later
                     # "continue" turns replay assistant("(empty)") as if it
@@ -7409,7 +7427,7 @@ def run_conversation(
                             "answer:\n\n" + reasoning_preview
                         )
                     else:
-                        final_response = "(empty)"
+                        final_response = EMPTY_RESPONSE_SENTINEL
                     break
                 
                 # Reset retry counter/signature on successful content

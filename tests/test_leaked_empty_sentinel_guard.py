@@ -24,6 +24,7 @@ from pathlib import Path
 import run_agent
 from agent.conversation_loop import (
     EMPTY_RESPONSE_SENTINEL,
+    _LEAKED_SENTINEL_PREFIX_RE,
     _visible_text_for_sentinel_check,
 )
 
@@ -32,6 +33,12 @@ SOURCE = SRC.read_text(encoding="utf-8")
 OWN_SOURCE = Path(__file__).read_text(encoding="utf-8")
 
 LEAK = "(empty) again risk. Need progress + tool. Already can. Use execute."
+
+# The real 2026-08-12 leak (state.db message id 139882, gpt-5.6-sol): a
+# paraphrase of our sentinel with a capital E, which the original literal
+# ``startswith("(empty)")`` guard did not catch. It ended a turn immediately
+# after a successful `patch` tool call, mid-task.
+CASED_LEAK = "(Empty again? Need tool call)"
 
 
 class _MinimalAgent:
@@ -73,6 +80,7 @@ def leaked_empty_sentinel(agent, final_response):
             {
                 "_visible_text_for_sentinel_check": _visible_text_for_sentinel_check,
                 "EMPTY_RESPONSE_SENTINEL": EMPTY_RESPONSE_SENTINEL,
+                "_LEAKED_SENTINEL_PREFIX_RE": _LEAKED_SENTINEL_PREFIX_RE,
                 "agent": agent,
                 "final_response": final_response,
                 "_visible_final": _visible_text_for_sentinel_check(final_response),
@@ -100,6 +108,42 @@ class TestLeakedEmptySentinel(unittest.TestCase):
 
     def test_leading_whitespace_does_not_evade(self):
         self.assertTrue(enters_recovery(self.agent, "\n  (empty) need tool"))
+
+    # ---- the 2026-08-12 recurrence: a CASED paraphrase of the sentinel ----
+
+    def test_the_cased_leak_recovers(self):
+        """The literal ``startswith("(empty)")`` guard missed this one."""
+        self.assertTrue(leaked_empty_sentinel(self.agent, CASED_LEAK))
+        self.assertTrue(enters_recovery(self.agent, CASED_LEAK))
+
+    def test_case_and_spacing_variants_recover(self):
+        for variant in (
+            "(Empty again? Need tool call)",
+            "(EMPTY) need a tool",
+            "( empty ) again",
+            "(Empty) — retrying",
+            "\n  (EmPtY again) need tool",
+        ):
+            with self.subTest(variant=variant):
+                self.assertTrue(
+                    enters_recovery(self.agent, variant),
+                    "a cased/spaced sentinel paraphrase must enter recovery",
+                )
+
+    def test_cased_mentions_of_empty_still_end_turn(self):
+        """Widening to case-insensitive must not swallow legitimate answers."""
+        for good in (
+            "Empty response guard fired once.",
+            "The result set was Empty.",
+            "(Emptying the queue took 4s.)",
+            "(Empathy is not the issue here.)",
+            "Done — no empty rows remain.",
+        ):
+            with self.subTest(good=good):
+                self.assertFalse(
+                    enters_recovery(self.agent, good),
+                    "must remain a prefix match on the sentinel WORD",
+                )
 
     # ---- BLOCKER from review round 1: crash on non-str content ----
 
@@ -201,20 +245,44 @@ class TestNoMirroredOracle(unittest.TestCase):
     def test_guard_expression_is_extracted_not_retyped(self):
         self.assertIn("ast.unparse", OWN_SOURCE)
         # The unparsed guard binds the pre-computed visible text and the shared
-        # constant — proof it came from production, not from this file.
+        # matcher — proof it came from production, not from this file. The
+        # sentinel constant itself is now referenced where the matcher is
+        # DERIVED (asserted in test_sentinel_is_a_shared_constant), not inline
+        # in the guard expression.
         self.assertIn("_visible_final", GUARD_EXPR)
-        self.assertIn("EMPTY_RESPONSE_SENTINEL", GUARD_EXPR)
+        self.assertIn("_LEAKED_SENTINEL_PREFIX_RE", GUARD_EXPR)
         self.assertIn("_has_content_after_think_block", GUARD_EXPR)
 
     def test_sentinel_is_a_shared_constant(self):
         self.assertEqual(EMPTY_RESPONSE_SENTINEL, "(empty)")
         code_only = "\n".join(l.split("#", 1)[0] for l in SOURCE.splitlines())
-        self.assertIn("startswith(EMPTY_RESPONSE_SENTINEL)", code_only)
+        # The matcher must be DERIVED from the constant, not retyped, so the
+        # guard cannot drift from the injection sites.
+        self.assertIn("re.escape(EMPTY_RESPONSE_SENTINEL", code_only)
+        self.assertIn("_LEAKED_SENTINEL_PREFIX_RE.match(", code_only)
 
     def test_guard_does_not_use_a_bare_lstrip(self):
         """Comments are stripped: they legitimately quote the old broken code."""
         code_only = "\n".join(l.split("#", 1)[0] for l in SOURCE.splitlines())
         self.assertNotIn('(final_response or "").lstrip()', code_only)
+
+    def test_injection_sites_use_the_constant_not_a_bare_literal(self):
+        """The sentinel is injected via the constant, never retyped.
+
+        This is the drift that produced the 2026-08-12 recurrence: the guard
+        and the injection sites each carried their own idea of the sentinel.
+        Assignments of a bare "(empty)" literal must not come back.
+        """
+        code_only = "\n".join(l.split("#", 1)[0] for l in SOURCE.splitlines())
+        for bad in (
+            '["content"] = "(empty)"',
+            'final_response = "(empty)"',
+        ):
+            self.assertNotIn(
+                bad,
+                code_only,
+                "inject EMPTY_RESPONSE_SENTINEL instead of a bare literal",
+            )
 
     def test_partial_stream_recovery_cannot_redeliver_the_leak(self):
         self.assertIn(
