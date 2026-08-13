@@ -191,6 +191,118 @@ def adaptive_rate_limit_backoff(
     return jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2), "zai_coding_overload_long"
 
 
+# ── provider capacity overload ──────────────────────────────────────────────
+#
+# Transient "the fleet is full right now" errors. These are NOT per-credential
+# rate limits and NOT billing walls: the request is valid and the credential is
+# fine, so the only recovery is to wait for capacity and re-send the same
+# request. Rotating a credential or failing the turn both waste the recovery.
+#
+# The default retry schedule (2s base, exponential, 3 attempts) exhausts in
+# ~19 seconds, which is far shorter than a real capacity window. Measured on
+# Kiro claude-opus-5, 2026-08-13: three attempts at 12:45:56, 12:46:02 and
+# 12:46:15 all returned HTTP 500 MODEL_TEMPORARILY_UNAVAILABLE, and the turn
+# was dropped 19s after the first failure. Same shape at 17:09 and 17:31 the
+# previous day. So give capacity errors their own longer schedule, mirroring
+# the Z.AI policy above.
+_CAPACITY_OVERLOAD_LONG_BACKOFF = (15.0, 30.0, 60.0, 90.0)
+
+# Short retries before the long tier engages. Kept at 2 (below the Z.AI 3) so
+# a capacity blip that clears immediately still recovers fast, while a genuine
+# capacity window reaches the long waits without burning the whole budget.
+_CAPACITY_OVERLOAD_SHORT_ATTEMPTS = 2
+
+# Statuses on which a capacity message is credible. A capacity phrase carried
+# by a 4xx that is not 429 (auth, not-found, malformed request) is text in a
+# deterministic rejection, not a transient overload, and must keep failing
+# fast. ``None`` is allowed because message-only classification paths have no
+# status to offer.
+_CAPACITY_OVERLOAD_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
+
+# Narrow, overload-flavoured phrases only. A generic word like "capacity" or
+# "unavailable" alone would collide with model-not-found and auth failures and
+# turn a deterministic error into minutes of pointless waiting.
+_CAPACITY_OVERLOAD_PATTERNS = (
+    "model_temporarily_unavailable",
+    "model temporarily unavailable",
+    "model is temporarily unavailable",
+    "unexpectedly high load",
+    "high load",
+    "insufficient capacity",
+    "capacity constraints",
+    "at capacity",
+    "over capacity",
+    "overloaded",
+)
+
+
+def is_capacity_overload_error(error: Any, *, status_code: int | None = None) -> bool:
+    """Return True for transient provider capacity/overload errors.
+
+    Matches the narrow set of capacity phrases in ``_CAPACITY_OVERLOAD_PATTERNS``
+    against the flattened error text, but only on a status where a capacity
+    claim is credible (``_CAPACITY_OVERLOAD_STATUSES``, or no status at all).
+
+    ``status_code`` overrides the status read off the error object, for callers
+    that already resolved it.
+    """
+    status = status_code if status_code is not None else getattr(error, "status_code", None)
+    if status is not None:
+        try:
+            status_int = int(status)
+        except (TypeError, ValueError):
+            return False
+        if status_int not in _CAPACITY_OVERLOAD_STATUSES:
+            return False
+    text = _error_text(error)
+    return any(p in text for p in _CAPACITY_OVERLOAD_PATTERNS)
+
+
+def capacity_overload_backoff(
+    attempt: int,
+    *,
+    default_wait: float,
+    short_attempts: int = _CAPACITY_OVERLOAD_SHORT_ATTEMPTS,
+) -> tuple[float, str | None]:
+    """Backoff schedule for transient provider capacity errors.
+
+    Keeps the first ``short_attempts`` retries on the caller's normal short
+    schedule, then walks 15s → 30s → 60s → 90s (capped at the final entry) with
+    light jitter so concurrent Hermes sessions do not resynchronize onto the
+    same retry instant.
+
+    ``attempt`` is 1-based, matching the retry loop's logged attempt number.
+    Returns ``(wait_seconds, reason_label)``.
+    """
+    if attempt <= short_attempts:
+        return default_wait, "capacity_overload_short"
+
+    idx = min(attempt - short_attempts - 1, len(_CAPACITY_OVERLOAD_LONG_BACKOFF) - 1)
+    base_delay = _CAPACITY_OVERLOAD_LONG_BACKOFF[idx]
+    # Small jitter ratio: long waits stay readable in the status line while
+    # still decorrelating retries across sessions.
+    return (
+        jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2),
+        "capacity_overload_long",
+    )
+
+
+def capacity_overload_retry_ceiling(
+    short_attempts: int = _CAPACITY_OVERLOAD_SHORT_ATTEMPTS,
+) -> int:
+    """Retry-loop ceiling needed for the full capacity backoff schedule.
+
+    Same reasoning as :func:`zai_coding_overload_retry_ceiling`: the loop gives
+    up as soon as ``retry_count >= ceiling``, and that check runs *before* the
+    attempt's backoff is computed, so the ceiling must sit one past the final
+    long-backoff entry for every long tier to actually execute.
+
+    With the default ``api_max_retries`` of 3, a capacity error exhausts during
+    the short tier and the long waits never run.
+    """
+    return short_attempts + len(_CAPACITY_OVERLOAD_LONG_BACKOFF) + 1
+
+
 def zai_coding_overload_retry_ceiling(short_attempts: int = _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS) -> int:
     """Retry-loop ceiling needed for the full Z.AI overload backoff schedule.
 

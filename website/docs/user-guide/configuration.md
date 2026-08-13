@@ -1000,6 +1000,13 @@ When the iteration budget is fully exhausted, the CLI shows a notification to th
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
+Two error shapes deliberately retry past this limit, because a short schedule cannot outlast them:
+
+- **Provider capacity errors** — a 5xx (or 429) whose body reports transient capacity pressure, such as `MODEL_TEMPORARILY_UNAVAILABLE` or "encountered unexpectedly high load". The credential and the request are both fine, so the only recovery is to wait for capacity. After two short attempts Hermes backs off 15s, 30s, 60s, then 90s, and reports `⏱️ Provider at capacity` while it waits. On the default budget these errors exhausted in about 19 seconds, which dropped turns inside a capacity window that had not closed yet. A `Retry-After` header, when the provider sends one, overrides the schedule. This applies only when no fallback is available: a configured fallback provider recovers in seconds, so it is tried first and the long waits are the last resort.
+- **Z.AI Coding Plan overloads** — HTTP 429 code 1305 on GLM-5.2, which backs off 30s, 60s, 90s, then 120s.
+
+Errors that are deterministic still fail fast on the normal budget. A plain 500 with no capacity signal, and a 4xx that merely mentions capacity in its text, both keep the default schedule, because retrying them only repeats the same rejection.
+
 ## Verify-on-Stop (coding verification)
 
 When enabled, Hermes refuses to accept a final answer on a turn where the agent edited code in a workspace but produced no fresh verification evidence (a passing test run, build, lint, etc.) — it injects a synthetic follow-up asking the agent to verify or explain why it can't. Doc/markdown/skill-only edits never trigger it, and the loop is bounded so it can never trap the agent.

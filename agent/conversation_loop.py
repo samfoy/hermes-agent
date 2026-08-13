@@ -81,6 +81,9 @@ from agent.prompt_caching import (
 )
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
+    capacity_overload_backoff,
+    capacity_overload_retry_ceiling,
+    is_capacity_overload_error,
     is_zai_coding_overload_error,
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
@@ -4893,6 +4896,32 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # Transient provider capacity errors ("high load",
+                # MODEL_TEMPORARILY_UNAVAILABLE) usually arrive as a plain 5xx,
+                # so they classify as generic `server_error` and inherit the
+                # short 2s-base schedule. The default 3 attempts then exhaust in
+                # ~19s — far inside a real capacity window — and the turn dies
+                # with a raw HTTP 500. Give them the longer schedule and a
+                # ceiling that can actually reach it. The narrow status+phrase
+                # gate in is_capacity_overload_error keeps deterministic errors
+                # (auth, model-not-found, malformed request) on fail-fast.
+                #
+                # Only when there is nothing better to switch to. Waiting out a
+                # capacity window is the *last* resort: a configured fallback
+                # provider recovers in seconds, so patiently sitting on the
+                # exhausted primary for minutes would be strictly worse than the
+                # behaviour this replaces. With a fallback available the normal
+                # budget runs, fallback activates, and the long schedule only
+                # applies afterwards if the fallback is itself capacity-limited.
+                _is_capacity_overload = (
+                    classified.retryable
+                    and not is_rate_limited
+                    and not _is_zai_coding_overload
+                    and not agent._has_pending_fallback()
+                    and is_capacity_overload_error(api_error, status_code=status_code)
+                )
+                if _is_capacity_overload:
+                    max_retries = max(max_retries, capacity_overload_retry_ceiling())
                 _should_fallback = (
                     is_rate_limited
                     or (_is_transport_failure and retry_count >= 2)
@@ -5977,9 +6006,11 @@ def run_conversation(
                         "billing_block": _billing_block,
                     }
 
-                # For rate limits, respect the Retry-After header if present
+                # For rate limits, respect the Retry-After header if present.
+                # Capacity overloads are included: a provider that tells us when
+                # capacity returns is more accurate than any local schedule.
                 _retry_after = None
-                if is_rate_limited:
+                if is_rate_limited or _is_capacity_overload:
                     _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
                     if _resp_headers and hasattr(_resp_headers, "get"):
                         _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
@@ -6003,18 +6034,38 @@ def run_conversation(
                         error=api_error,
                         default_wait=wait_time,
                     )
-                if is_rate_limited or _is_zai_coding_overload:
+                elif _is_capacity_overload:
+                    # Capacity errors get the longer 15/30/60/90s schedule after
+                    # a couple of short attempts. A Retry-After header, when the
+                    # provider bothers to send one, still wins.
+                    if _retry_after:
+                        _backoff_policy = "capacity_overload_retry_after"
+                    else:
+                        wait_time, _backoff_policy = capacity_overload_backoff(
+                            retry_count,
+                            default_wait=wait_time,
+                        )
+                if is_rate_limited or _is_zai_coding_overload or _is_capacity_overload:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"
                     elif _backoff_policy == "zai_coding_overload_short":
                         _policy_note = " (Z.AI Coding overload short retry)"
-                    _wait_reason = "Provider overloaded" if _is_zai_coding_overload and not is_rate_limited else "Rate limited"
+                    elif _backoff_policy == "capacity_overload_retry_after":
+                        _policy_note = " (provider Retry-After)"
+                    if _is_capacity_overload:
+                        _wait_reason = "Provider at capacity"
+                    elif _is_zai_coding_overload and not is_rate_limited:
+                        _wait_reason = "Provider overloaded"
+                    else:
+                        _wait_reason = "Rate limited"
                     _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
                     # Normal retries are buffered to avoid noisy transient chatter. Long
                     # Z.AI Coding waits are different: they can last minutes, so surface
-                    # progress immediately instead of making the TUI look frozen.
-                    if _backoff_policy == "zai_coding_overload_long":
+                    # progress immediately instead of making the TUI look frozen. Long
+                    # capacity waits have the same problem — a silent 90s wait is
+                    # indistinguishable from a hang.
+                    if _backoff_policy in {"zai_coding_overload_long", "capacity_overload_long"}:
                         agent._emit_status(_rate_limit_status)
                     else:
                         agent._buffer_status(_rate_limit_status)
