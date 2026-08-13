@@ -88,7 +88,59 @@ def _require_boto3():
     return boto3
 
 
-def _get_bedrock_runtime_client(region: str):
+# Botocore defaults ``read_timeout`` to 60s, which is far below the wire-event
+# gap of a reasoning model on a long context. Hermes owns dead-stream detection
+# via its own stale-stream watchdog (which scales to 300s for >100k-token
+# contexts) because that is the layer holding the diagnostics, per-region client
+# eviction, and retry/fallback escalation. The socket read timeout must
+# therefore sit ABOVE the watchdog ceiling so the watchdog always fires first.
+_DEFAULT_BEDROCK_READ_TIMEOUT = 900.0
+
+# A long connect timeout only delays failover to a fallback provider: TCP
+# connect either succeeds fast or the endpoint is unreachable.
+_DEFAULT_BEDROCK_CONNECT_TIMEOUT = 10.0
+
+
+def _resolve_bedrock_read_timeout(provider_timeout: Optional[float] = None) -> float:
+    """Resolve the boto3 ``read_timeout`` for Bedrock clients.
+
+    Priority: explicit ``provider_timeout`` (from
+    ``providers.<name>.request_timeout_seconds``) → ``HERMES_BEDROCK_READ_TIMEOUT``
+    env var → :data:`_DEFAULT_BEDROCK_READ_TIMEOUT`.
+
+    A non-positive value at any layer is treated as misconfiguration and falls
+    back to the default. Disabling the timeout entirely is never correct: it
+    converts a recoverable stale socket into a permanently hung turn.
+    """
+    for candidate in (provider_timeout, os.environ.get("HERMES_BEDROCK_READ_TIMEOUT")):
+        if candidate is None or candidate == "":
+            continue
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return _DEFAULT_BEDROCK_READ_TIMEOUT
+
+
+def _bedrock_client_config(provider_timeout: Optional[float] = None):
+    """Build the botocore ``Config`` shared by both Bedrock clients."""
+    from botocore.config import Config
+
+    return Config(
+        read_timeout=_resolve_bedrock_read_timeout(provider_timeout),
+        connect_timeout=_DEFAULT_BEDROCK_CONNECT_TIMEOUT,
+        # ``legacy`` (the default) misses several throttling and 5xx shapes
+        # Bedrock returns under load.
+        retries={"max_attempts": 3, "mode": "standard"},
+        # Long thinking pauses are exactly when NAT gateways, VPNs, and proxies
+        # silently cull an idle socket.
+        tcp_keepalive=True,
+    )
+
+
+def _get_bedrock_runtime_client(region: str, provider_timeout: Optional[float] = None):
     """Get or create a cached ``bedrock-runtime`` client for the given region.
 
     Uses the default AWS credential chain (env vars → profile → instance role).
@@ -97,16 +149,18 @@ def _get_bedrock_runtime_client(region: str):
         boto3 = _require_boto3()
         _bedrock_runtime_client_cache[region] = boto3.client(
             "bedrock-runtime", region_name=region,
+            config=_bedrock_client_config(provider_timeout),
         )
     return _bedrock_runtime_client_cache[region]
 
 
-def _get_bedrock_control_client(region: str):
+def _get_bedrock_control_client(region: str, provider_timeout: Optional[float] = None):
     """Get or create a cached ``bedrock`` control-plane client for model discovery."""
     if region not in _bedrock_control_client_cache:
         boto3 = _require_boto3()
         _bedrock_control_client_cache[region] = boto3.client(
             "bedrock", region_name=region,
+            config=_bedrock_client_config(provider_timeout),
         )
     return _bedrock_control_client_cache[region]
 
@@ -203,14 +257,30 @@ def is_stale_connection_error(exc: BaseException) -> bool:
     if botocore_errors and isinstance(exc, botocore_errors):
         return True
 
-    # urllib3: low-level transport failures
+    # urllib3: low-level transport failures.
+    #
+    # ReadTimeoutError/ConnectTimeoutError must be listed EXPLICITLY. botocore
+    # only translates urllib3 exceptions into its own hierarchy inside
+    # ``URLLib3Session.send()`` (the initial request). Mid-stream EventStream
+    # reads happen outside that try/except, so a urllib3 timeout escapes
+    # unwrapped — and it inherits from PoolError/HTTPError, NOT from
+    # ProtocolError or ConnectionError, so the family checks below miss it.
+    # This is the ``AWSHTTPSConnectionPool(...): Read timed out.`` failure.
     try:
         from urllib3.exceptions import (
             ProtocolError,
             NewConnectionError,
             ConnectionError as Urllib3ConnectionError,
+            ReadTimeoutError as Urllib3ReadTimeoutError,
+            ConnectTimeoutError as Urllib3ConnectTimeoutError,
         )
-        urllib3_errors = (ProtocolError, NewConnectionError, Urllib3ConnectionError)
+        urllib3_errors = (
+            ProtocolError,
+            NewConnectionError,
+            Urllib3ConnectionError,
+            Urllib3ReadTimeoutError,
+            Urllib3ConnectTimeoutError,
+        )
     except ImportError:  # pragma: no cover
         urllib3_errors = ()
     if urllib3_errors and isinstance(exc, urllib3_errors):
