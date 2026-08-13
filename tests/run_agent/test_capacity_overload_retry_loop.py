@@ -288,6 +288,83 @@ class TestFallbackBeatsWaiting:
         )
 
 
+class TestCompressionWinsOverWaiting:
+    """A message can carry BOTH an overflow signal and a capacity word, e.g.
+    vLLM's ``server overloaded: prompt exceeds the max_model_len 32768``.
+
+    There the request is too big. Shrinking it is the recovery, so the capacity
+    schedule must stand aside — waiting cannot succeed on its own and only
+    delays the fix.
+
+    Note on coverage: for *this* input the compression branch returns before the
+    backoff code is reached, so the end-to-end test below passes with or without
+    the ``should_compress`` exclusion and is a characterization test, not a
+    revert-sensitive one. The gate assertion that actually holds the line is
+    ``test_gate_refuses_capacity_schedule_when_compression_was_requested``,
+    which fails if the exclusion is dropped. Both are kept: the first pins the
+    observable behaviour, the second pins the reason.
+    """
+
+    def test_overflow_message_mentioning_overload_still_compresses_fast(self):
+        agent = _make_agent()
+
+        class OverflowWithCapacityWords(Exception):
+            status_code = 500
+
+            def __init__(self):
+                msg = "server overloaded: prompt exceeds the max_model_len 32768"
+                super().__init__(f"Error code: 500 - {msg}")
+                self.response = SimpleNamespace(headers={})
+                self.body = {"error": {"message": msg}}
+
+        def always_overflow(api_kwargs):
+            raise OverflowWithCapacityWords()
+
+        _result, waits = _run(agent, always_overflow)
+
+        assert not waits or max(waits) < 15.0, (
+            f"an overflow error must take the compression path, not minutes of "
+            f"capacity backoff; waits={[round(w, 1) for w in waits]}"
+        )
+
+    def test_gate_refuses_capacity_schedule_when_compression_was_requested(self):
+        """Revert-sensitive: mirrors the loop's gate for a real mixed message.
+
+        The phrase list alone DOES match this error, which is exactly why the
+        gate needs the ``should_compress`` exclusion rather than relying on the
+        patterns being narrow enough.
+        """
+        from agent.error_classifier import classify_api_error
+        from agent.retry_utils import is_capacity_overload_error
+
+        class E(Exception):
+            status_code = 500
+
+            def __init__(self, msg):
+                super().__init__(f"Error code: 500 - {msg}")
+                self.message = msg
+                self.body = {"error": {"message": msg}}
+
+        for msg in (
+            "server overloaded: prompt exceeds the max_model_len 32768",
+            "context length exceeded while server under high load",
+        ):
+            err = E(msg)
+            classified = classify_api_error(err, provider="vllm", model="local")
+
+            assert is_capacity_overload_error(err, status_code=500) is True, msg
+            assert classified.should_compress is True, msg
+
+            gate = (
+                classified.retryable
+                and not classified.should_compress
+                and is_capacity_overload_error(err, status_code=500)
+            )
+            assert gate is False, (
+                f"compression must win over the capacity schedule for: {msg}"
+            )
+
+
 class TestNonCapacityErrorsUnchanged:
     def test_plain_500_still_fails_fast_on_the_default_budget(self):
         """The guard against turning every 5xx into minutes of waiting.

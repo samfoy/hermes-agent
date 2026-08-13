@@ -4913,8 +4913,16 @@ def run_conversation(
                 # behaviour this replaces. With a fallback available the normal
                 # budget runs, fallback activates, and the long schedule only
                 # applies afterwards if the fallback is itself capacity-limited.
+                #
+                # Never when the classifier asked for compression. A message can
+                # carry BOTH an overflow signal and a capacity word (vLLM:
+                # "server overloaded: prompt exceeds the max_model_len 32768").
+                # There the request is too big and shrinking it is the actual
+                # recovery, so waiting 90s just delays the fix and can never
+                # succeed on its own.
                 _is_capacity_overload = (
                     classified.retryable
+                    and not classified.should_compress
                     and not is_rate_limited
                     and not _is_zai_coding_overload
                     and not agent._has_pending_fallback()
